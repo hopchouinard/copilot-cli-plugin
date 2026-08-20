@@ -43,4 +43,65 @@ export function renderSetupReport(report) {
   return `${lines.join("\n")}\n`;
 }
 
+const SEVERITY_ORDER = { critical: 0, high: 1, medium: 2, low: 3 };
+
+export function renderReviewResult(parsed, options = {}) {
+  const lines = [`# ${options.reviewLabel} — ${options.targetLabel}`, ""];
+
+  if (options.costLabel) {
+    lines.push(`model  ${options.costLabel}`);
+  }
+  const usageLine = formatUsage(options.usage);
+  if (usageLine) {
+    lines.push(`usage  ${usageLine}`);
+  }
+  if (options.costLabel || usageLine) {
+    lines.push("");
+  }
+
+  if (!parsed.parsed) {
+    lines.push("Copilot did not return parseable JSON.");
+    lines.push("");
+    lines.push(`Parse error: ${parsed.parseError}`);
+    lines.push("");
+    lines.push("Raw output:");
+    lines.push("");
+    lines.push(parsed.rawOutput);
+    return `${lines.join("\n")}\n`;
+  }
+
+  const result = parsed.parsed;
+  lines.push(`Verdict: ${result.verdict}`);
+  lines.push("");
+  lines.push(result.summary);
+  lines.push("");
+
+  const findings = [...(result.findings ?? [])].sort(
+    (left, right) => (SEVERITY_ORDER[left.severity] ?? 9) - (SEVERITY_ORDER[right.severity] ?? 9)
+  );
+
+  if (findings.length === 0) {
+    lines.push("No findings.");
+  } else {
+    for (const finding of findings) {
+      lines.push(`## [${finding.severity}] ${finding.title}`);
+      lines.push(`${finding.file}:${finding.line_start}-${finding.line_end} (confidence ${finding.confidence})`);
+      lines.push("");
+      lines.push(finding.body);
+      lines.push("");
+      lines.push(`Recommendation: ${finding.recommendation}`);
+      lines.push("");
+    }
+  }
+
+  if ((result.next_steps ?? []).length > 0) {
+    lines.push("## Next steps");
+    for (const step of result.next_steps) {
+      lines.push(`- ${step}`);
+    }
+  }
+
+  return `${lines.join("\n")}\n`;
+}
+
 export { formatUsage };
