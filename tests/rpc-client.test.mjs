@@ -72,3 +72,48 @@ test("client routes notifications to the handler", async () => {
   assert.ok(seen.includes("session.event"));
   await client.close();
 });
+
+import fs from "node:fs";
+import os from "node:os";
+
+const STUB_CRASH = path.join(path.dirname(fileURLToPath(import.meta.url)), "stub-copilot-crash.mjs");
+const STUB_REFUSE = path.join(path.dirname(fileURLToPath(import.meta.url)), "stub-copilot-refuse.mjs");
+
+test("a pending request rejects when the child exits unexpectedly", async () => {
+  const client = await CopilotRpcClient.connect(process.cwd(), { binary: STUB_CRASH });
+  await assert.rejects(() => client.request("ping", {}), /exited unexpectedly/);
+  await client.close();
+});
+
+test("request after an unexpected child exit rejects rather than writing to dead stdin", async () => {
+  const client = await CopilotRpcClient.connect(process.cwd(), { binary: STUB_CRASH });
+  await assert.rejects(() => client.request("ping", {}), /exited unexpectedly/);
+  // The child is already gone. A second request must reject immediately
+  // instead of writing to a dead stdin (which would emit an unhandled
+  // EPIPE 'error' with no listener).
+  await assert.rejects(() => client.request("ping", {}), /closed/);
+  await client.close();
+});
+
+test("the handshake-refusal path leaves no live child process", async () => {
+  const pidFile = path.join(os.tmpdir(), `copilot-stub-pid-${process.pid}-${Date.now()}`);
+  await assert.rejects(
+    () =>
+      CopilotRpcClient.connect(process.cwd(), {
+        binary: STUB_REFUSE,
+        env: { ...process.env, STUB_PID_FILE: pidFile }
+      }),
+    /refused the SDK handshake/
+  );
+
+  const pid = Number(fs.readFileSync(pidFile, "utf8"));
+  fs.unlinkSync(pidFile);
+
+  let alive = true;
+  try {
+    process.kill(pid, 0);
+  } catch (error) {
+    alive = error.code !== "ESRCH";
+  }
+  assert.equal(alive, false, "expected the stub child process to be terminated");
+});

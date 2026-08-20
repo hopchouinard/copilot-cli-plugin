@@ -83,6 +83,14 @@ export class CopilotRpcClient {
       this.stderr += chunk;
     });
 
+    this.proc.stdin.on("error", () => {
+      // A write can race a child that has already exited (EPIPE/ECONNRESET).
+      // request()/notify() guard against writing once the exit is observed,
+      // but a write can still be in flight when the child dies; swallow it
+      // here so it never becomes an unhandled EventEmitter error that takes
+      // down the host process.
+    });
+
     this.proc.on("error", (error) => this.handleExit(error));
     this.proc.on("exit", (code, signal) => {
       const detail = this.stderr.trim();
@@ -100,6 +108,7 @@ export class CopilotRpcClient {
       try {
         messages = this.decode(chunk);
       } catch (error) {
+        this.forceKillProcess();
         this.handleExit(error);
         return;
       }
@@ -110,9 +119,11 @@ export class CopilotRpcClient {
 
     const handshake = await this.request("connect", { protocolVersion: REQUIRED_PROTOCOL_VERSION });
     if (!handshake?.ok) {
+      await this.forceKillProcess();
       throw new Error("Copilot CLI refused the SDK handshake.");
     }
     if (Number(handshake.protocolVersion) < REQUIRED_PROTOCOL_VERSION) {
+      await this.forceKillProcess();
       throw new Error(
         `Copilot CLI speaks protocol ${handshake.protocolVersion}; this plugin needs ${REQUIRED_PROTOCOL_VERSION}. Update with \`npm install -g @github/copilot\`.`
       );
@@ -160,7 +171,7 @@ export class CopilotRpcClient {
   }
 
   request(method, params = {}) {
-    if (this.closed) {
+    if (this.closed || this.exitResolved) {
       return Promise.reject(new Error("copilot rpc client is closed."));
     }
     const id = this.nextId++;
@@ -171,10 +182,27 @@ export class CopilotRpcClient {
   }
 
   notify(method, params = {}) {
-    if (this.closed) {
+    if (this.closed || this.exitResolved) {
       return;
     }
     this.proc.stdin.write(encodeMessage({ jsonrpc: "2.0", method, params }));
+  }
+
+  async forceKillProcess(signal = "SIGTERM") {
+    const proc = this.proc;
+    if (!proc || proc.exitCode !== null || proc.signalCode !== null) {
+      return;
+    }
+    const exited = new Promise((resolve) => proc.once("exit", resolve));
+    proc.kill(signal);
+    const escalate = setTimeout(() => {
+      if (proc.exitCode === null && proc.signalCode === null) {
+        proc.kill("SIGKILL");
+      }
+    }, 200);
+    escalate.unref?.();
+    await exited;
+    clearTimeout(escalate);
   }
 
   async close() {
