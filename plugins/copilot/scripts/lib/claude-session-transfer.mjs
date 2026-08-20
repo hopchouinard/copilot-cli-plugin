@@ -147,6 +147,15 @@ export function redactCredentials(command) {
   // "AWS_SECRET_ACCESS_KEY" still matches in full while "KEYBOARD" does not
   // match at all.
   //
+  // An optional numeric suffix — `_?\d+` — is allowed between the keyword
+  // and the lookahead, so rotated/numbered credential names like `KEY2`,
+  // `TOKEN_2`, and `AWS_ACCESS_KEY_2` still match (a plausible, common
+  // real-world shape). This does not reopen the over-redaction hole: a
+  // *letter* suffix ("BOARD", "IZER", "ARY", ...) still fails the
+  // lookahead exactly as before, since the numeric-suffix alternative only
+  // ever consumes digits (and an optional leading underscore) — "TOKENS"
+  // and "KEYS" still fall through untouched.
+  //
   // The value is one alternation with three fully-bounded branches, each
   // chosen so the match can never stop short of the real value boundary
   // and leave a marker sitting beside untouched secret text:
@@ -163,23 +172,30 @@ export function redactCredentials(command) {
   //      happen: a value that opens with a quote is never left partially
   //      unconsumed.
   //   3. Unquoted — up to the next space/quote, or empty if none.
-  // If the matched value is a quote-less empty string (branch 3, nothing
-  // to redact at all — e.g. `TOKEN=` with nothing following), the original
-  // text is returned untouched rather than inserting a marker beside
-  // nothing: leaving it alone is honest, and only branches 1/2 (where a
-  // quote was actually opened) ever warrant a marker.
+  //
+  // The empty-span guard is a SINGLE rule applied uniformly to whichever
+  // branch matched, not a per-branch special case: this class of bug
+  // (marker inserted beside a value the pattern didn't actually capture)
+  // has recurred twice already, each time in a branch nobody had checked.
+  // If the captured value — terminated-quoted, unterminated-quoted, or
+  // unquoted, whichever fired — is the empty string, the match is
+  // returned unchanged and no marker is inserted at all, so `TOKEN=""`
+  // stays `TOKEN=""` rather than becoming `TOKEN="<redacted>"`, and any
+  // future branch added here inherits the same protection for free.
   redacted = redacted.replace(
-    /\b((?:[A-Za-z0-9_]*_)?(?:TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL)(?![A-Za-z0-9]))(\s*=\s*)(?:(["'])(?:((?:(?!\3)[\s\S])*)\3|([\s\S]*))|([^\s"']*))/gi,
-    (match, name, eq, quote, terminatedValue, _unterminatedValue, unquotedValue) => {
+    /\b((?:[A-Za-z0-9_]*_)?(?:TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL)(?:_?\d+)?(?![A-Za-z0-9]))(\s*=\s*)(?:(["'])(?:((?:(?!\3)[\s\S])*)\3|([\s\S]*))|([^\s"']*))/gi,
+    (match, name, eq, quote, terminatedValue, unterminatedValue, unquotedValue) => {
+      const value = terminatedValue !== undefined ? terminatedValue : unterminatedValue !== undefined ? unterminatedValue : unquotedValue;
+      if (!value) {
+        return match;
+      }
       if (quote !== undefined) {
-        // terminatedValue is defined (even as "") only when branch 1 (a
-        // real closing quote) matched; branch 2's unterminatedValue never
-        // gets a closing quote to echo back, since none existed.
+        // terminatedValue is defined (even as "", already excluded above)
+        // only when branch 1 (a real closing quote) matched; branch 2's
+        // unterminatedValue never gets a closing quote to echo back, since
+        // none existed.
         const closingQuote = terminatedValue !== undefined ? quote : "";
         return `${name}${eq}${quote}<redacted>${closingQuote}`;
-      }
-      if (!unquotedValue) {
-        return match;
       }
       return `${name}${eq}<redacted>`;
     }

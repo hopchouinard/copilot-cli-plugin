@@ -364,7 +364,14 @@ test("redactCredentials never emits <redacted> directly adjacent to the real sec
     // "secret" here is everything after the opening quote, since a quote
     // that never closes must be redacted through the end of the string.
     { command: 'TOKEN="abcsecretvalue', secret: "abcsecretvalue" },
-    { command: 'MY_TOKEN="ghp_unterminated', secret: "ghp_unterminated" }
+    { command: 'MY_TOKEN="ghp_unterminated', secret: "ghp_unterminated" },
+    // Numbered/rotated credential names — a plausible real-world shape
+    // (KEY2, TOKEN_2, ...) that the letter-suffix-blocking lookahead must
+    // not also block, since it only ever consumes digits.
+    { command: "KEY2=abc123realsecret", secret: "abc123realsecret" },
+    { command: "TOKEN_2=abc123realsecret", secret: "abc123realsecret" },
+    { command: "API_KEY_2=abc123realsecret", secret: "abc123realsecret" },
+    { command: "AWS_ACCESS_KEY_2=abc123realsecret run.sh", secret: "abc123realsecret" }
   ];
 
   const escapeRegExp = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -394,7 +401,14 @@ test("redactCredentials does not over-redact identifiers that merely start with 
     "--keyfile=/etc/ssl/x.pem",
     "TOKENIZER=bpe run.sh",
     "SECRETARY=jane schedule.sh",
-    "MONKEY=1"
+    "MONKEY=1",
+    // A LETTER suffix must still fail the lookahead even after the
+    // numeric-suffix allowance was added for KEY2/TOKEN_2/etc — the
+    // numeric-suffix alternative only ever consumes digits (and an
+    // optional leading underscore), so plurals like these must not
+    // reopen the over-redaction hole.
+    "TOKENS=abc",
+    "KEYS=abc"
   ];
   for (const command of untouched) {
     assert.equal(redactCredentials(command), command);
@@ -413,8 +427,17 @@ test("redactCredentials redacts an unterminated quoted value through the end of 
   assert.equal(redactCredentials('MY_TOKEN="ghp_unterminated'), 'MY_TOKEN="<redacted>');
 });
 
-test("redactCredentials leaves a genuinely empty assignment untouched rather than inserting a marker beside nothing", () => {
-  assert.equal(redactCredentials("TOKEN="), "TOKEN=");
+test("redactCredentials leaves a genuinely empty value untouched, in every branch, rather than inserting a marker beside nothing", () => {
+  // This is a SINGLE guard applied uniformly to whichever branch matched
+  // (terminated-quoted, unterminated-quoted, or unquoted) — not a
+  // per-branch special case. The same failure shape (marker inserted next
+  // to a value the pattern didn't actually capture) has recurred twice
+  // already, each time in a branch nobody had checked, so every branch
+  // gets covered here rather than just the one shape found so far.
+  assert.equal(redactCredentials("TOKEN="), "TOKEN=", "unquoted empty value");
+  assert.equal(redactCredentials('TOKEN=""'), 'TOKEN=""', "terminated double-quoted empty value");
+  assert.equal(redactCredentials("TOKEN=''"), "TOKEN=''", "terminated single-quoted empty value");
+  assert.equal(redactCredentials('TOKEN="'), 'TOKEN="', "unterminated quote with nothing after it");
 });
 
 test("the digest redacts credential-shaped commands before they reach the markdown", () => {
