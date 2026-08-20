@@ -19,6 +19,24 @@ function withScenario(scenario) {
   return { binary: FIXTURE, env: { ...process.env, FAKE_COPILOT_SCRIPT: scenarioFile(scenario) } };
 }
 
+// Like withScenario, but also points the fixture at a capture file so a test
+// can read back exactly which RPC calls (and params) the fixture received.
+function withCaptureScenario(scenario) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "copilot-scn-"));
+  const scenarioPath = path.join(dir, "scenario.json");
+  fs.writeFileSync(scenarioPath, JSON.stringify(scenario), "utf8");
+  const capturePath = path.join(dir, "capture.json");
+  return {
+    binary: FIXTURE,
+    env: { ...process.env, FAKE_COPILOT_SCRIPT: scenarioPath, FAKE_COPILOT_CAPTURE_FILE: capturePath },
+    capturePath
+  };
+}
+
+function readCapturedCalls(capturePath) {
+  return fs.existsSync(capturePath) ? JSON.parse(fs.readFileSync(capturePath, "utf8")) : [];
+}
+
 test("auth status reports the fixture login", async () => {
   const status = await getCopilotAuthStatus(process.cwd(), withScenario({}));
   assert.equal(status.loggedIn, true);
@@ -78,13 +96,43 @@ test("a turn that ends without turn_end still resolves via the inferred timer", 
 });
 
 test("read-only turns exclude write tools and set plan mode", async () => {
+  const capture = withCaptureScenario({});
   const result = await runCopilotTurn(process.cwd(), {
     prompt: "go",
     model: "claude-haiku-4.5",
     readOnly: true,
-    ...withScenario({})
+    ...capture
   });
   assert.equal(result.mode, "plan");
+
+  const created = readCapturedCalls(capture.capturePath).find((call) => call.method === "session.create");
+  assert.ok(created, "expected a session.create call to be captured");
+  assert.equal(created.params.requestPermission, true);
+  assert.ok(
+    Array.isArray(created.params.excludedTools) && created.params.excludedTools.length > 0,
+    "session.create should transmit a non-empty excludedTools list for a read-only turn"
+  );
+});
+
+test("read-only turns on the resume path also transmit tool exclusions and permission requests", async () => {
+  const capture = withCaptureScenario({});
+  const result = await runCopilotTurn(process.cwd(), {
+    prompt: "continue",
+    model: "claude-haiku-4.5",
+    readOnly: true,
+    sessionId: "resumed-session-1",
+    ...capture
+  });
+  assert.equal(result.mode, "plan");
+  assert.equal(result.sessionId, "resumed-session-1");
+
+  const resumed = readCapturedCalls(capture.capturePath).find((call) => call.method === "session.resume");
+  assert.ok(resumed, "expected a session.resume call to be captured");
+  assert.equal(resumed.params.requestPermission, true);
+  assert.ok(
+    Array.isArray(resumed.params.excludedTools) && resumed.params.excludedTools.length > 0,
+    "session.resume should transmit the same excludedTools restrictions as session.create for a read-only turn"
+  );
 });
 
 test("parseStructuredOutput strips a fenced code block before parsing", () => {

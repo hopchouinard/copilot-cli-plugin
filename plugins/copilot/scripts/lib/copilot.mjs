@@ -234,7 +234,12 @@ export async function runCopilotTurn(cwd, options = {}) {
 
     if (resuming) {
       emit(options.onProgress, `Resuming session ${sessionId}.`, "starting");
-      await client.request("session.resume", { sessionId, workingDirectory: cwd });
+      await client.request("session.resume", {
+        sessionId,
+        workingDirectory: cwd,
+        ...(options.readOnly ? { excludedTools: READ_ONLY_EXCLUDED_TOOLS } : {}),
+        requestPermission: Boolean(options.readOnly)
+      });
     } else {
       emit(options.onProgress, "Creating Copilot session.", "starting");
       await client.request("session.create", {

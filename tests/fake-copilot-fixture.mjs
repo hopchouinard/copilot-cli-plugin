@@ -38,6 +38,20 @@ function emitEvent(sessionId, event) {
   send({ jsonrpc: "2.0", method: "session.event", params: { sessionId, event } });
 }
 
+// Records every RPC call the fixture receives, keyed by method, so tests
+// running in a separate process can assert on exactly what the client sent.
+// Written synchronously on every call (rather than only at exit) so a test
+// can read it as soon as the corresponding client.request() resolves.
+const CAPTURE_FILE = process.env.FAKE_COPILOT_CAPTURE_FILE;
+const recordedCalls = [];
+
+function recordCall(method, params) {
+  recordedCalls.push({ method, params });
+  if (CAPTURE_FILE) {
+    fs.writeFileSync(CAPTURE_FILE, JSON.stringify(recordedCalls), "utf8");
+  }
+}
+
 const handlers = {
   connect: () => ({ ok: true, protocolVersion: 3, version: scenario.version ?? "1.0.80" }),
   ping: () => ({ message: "pong", timestamp: "2026-01-01T00:00:00.000Z", protocolVersion: 3 }),
@@ -51,7 +65,11 @@ const handlers = {
     },
   "models.list": () => ({ models: scenario.models ?? DEFAULT_MODELS }),
   "session.create": (params) => {
-    createdSessions.push(params);
+    recordCall("session.create", params);
+    return { sessionId: params.sessionId, workspacePath: `/tmp/fake/${params.sessionId}`, capabilities: {} };
+  },
+  "session.resume": (params) => {
+    recordCall("session.resume", params);
     return { sessionId: params.sessionId, workspacePath: `/tmp/fake/${params.sessionId}`, capabilities: {} };
   },
   "session.mode.set": () => null,
@@ -66,8 +84,6 @@ const handlers = {
     return { messageId: "msg-1" };
   }
 };
-
-const createdSessions = [];
 
 function replayEvents(sessionId) {
   const events = scenario.events ?? [
@@ -97,5 +113,4 @@ process.stdin.on("data", (chunk) => {
   }
 });
 
-// Expose what the client sent, for assertions.
 process.on("SIGTERM", () => process.exit(0));
