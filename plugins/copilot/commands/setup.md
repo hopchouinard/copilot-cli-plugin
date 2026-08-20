@@ -18,13 +18,14 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/copilot-companion.mjs" models
 - **If the output says no model catalog is cached**, there is nothing to pick from — this is a first run, or Copilot is unreachable. Do not show it and do not ask. Drop `<bare-flag>` from the arguments entirely, continue with the normal setup flow below including the install and authentication steps, and once setup reports Copilot is ready, run the `models` command again and resume this picker. If Copilot still is not ready, say so and stop; a model cannot be chosen without a roster.
 - Otherwise show the table to the user **exactly as returned**. It is already numbered, sorted cheapest first, and marks which models the review and task roles currently use. Do not rebuild it, truncate it, or re-order it, and do not use `AskUserQuestion` — the whole point of the table is that it lists every model, and an `AskUserQuestion` caps at four options.
 - Then stop and let the user answer. Ask them which model they want, naming what `<bare-flag>` will change: `--review-model` affects reviews only, `--task-model` affects rescue and transfer runs, `--model` affects both.
-- When they reply, rebuild the original argument list with `<bare-flag>` given their answer as its value and every other original argument preserved, then continue below with that. For example, if the user ran `/copilot:setup --review-model --enable-review-gate` and answered `4`:
+- When they reply, **convert their answer to a model id** by reading it off the row they picked in the table you just displayed, then rebuild the original argument list with `<bare-flag>` given that id as its value and every other original argument preserved. For example, if the user ran `/copilot:setup --review-model --enable-review-gate` and answered `4` on a table whose row 4 was `mai-code-1-flash-picker`:
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/copilot-companion.mjs" setup --json --review-model 4 --enable-review-gate
+node "${CLAUDE_PLUGIN_ROOT}/scripts/copilot-companion.mjs" setup --json --review-model mai-code-1-flash-picker --enable-review-gate
 ```
 
-  The script resolves a row number or a model id itself, using the same ordering the table was numbered with, so forward what they typed verbatim rather than mapping it to an id yourself. If they typed something invalid the script reports the valid range — show that and ask again.
+  Pass the id, not the number. A row number is an index into a catalog that can change between the moment the table was rendered and the moment `setup` resolves it — `setup` may refresh the roster itself — so a number can name a different model than the row the user read. The id is stable and cannot drift. The script does accept a row number, which is what makes `--model 4` work when you run it directly from a shell straight after `models`, but nothing should send one across two separate invocations.
+- If they typed a model id rather than a number, pass it through unchanged. If they typed something that is neither, say so and ask again rather than guessing.
 - If the user names a model in the same message that invoked the command ("use sonnet", "pick the cheapest"), skip the table and resolve it directly.
 
 Run:

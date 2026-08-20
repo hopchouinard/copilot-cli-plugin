@@ -250,9 +250,13 @@ test("setup.md drives the picker from the models table, not from AskUserQuestion
   );
 });
 
-test("setup.md forwards the raw answer rather than mapping the number itself", () => {
+test("setup.md still documents that a row number works when run directly from a shell", () => {
+  // The script keeps accepting numbers — that is what makes `--model 4` useful
+  // straight after `models` in a terminal. What changed is that a COMMAND,
+  // which spans two process invocations, must send the id instead.
   const source = readCommand("setup.md");
-  assert.match(source, /forward what they typed verbatim/i);
+  assert.match(source, /The script does accept a row number/);
+  assert.match(source, /nothing should send one across two separate invocations/);
 });
 
 test("every cost-guard command offers the full roster, not only the cheapest model", () => {
@@ -357,8 +361,49 @@ test("setup.md reuses the bare flag it detected rather than substituting --model
   );
   assert.match(
     source,
-    /setup --json --review-model 4/,
+    /setup --json --review-model mai-code-1-flash-picker/,
     "the worked example must show a role-specific flag surviving, not --model"
+  );
+});
+
+// ---------------------------------------------------------------------------
+// PR #2 review, second round (Codex P1): a row number is an index into a
+// catalog that can change. Resolving it consistently INSIDE one process does
+// not help if the number is then handed to a second process — anything that
+// refreshes the shared catalog in between re-numbers the rows, so the guard
+// can price one model while the run uses another. Ids cross process
+// boundaries; numbers do not.
+// ---------------------------------------------------------------------------
+
+test("every cost-guard command launches with the guard's resolved id, never a row number", () => {
+  for (const name of ["review.md", "adversarial-review.md", "rescue.md"]) {
+    const source = readCommand(name);
+    assert.match(source, /Never forward a row number to the launch command/, name);
+    assert.match(
+      source,
+      /replace it with the `model` id the guard returned/,
+      `${name} must replace a supplied number with the guard's id`
+    );
+    assert.match(
+      source,
+      /separate processes/,
+      `${name} must explain why a number cannot cross the guard-to-launch boundary`
+    );
+  }
+});
+
+test("setup.md sends the chosen model's id rather than its row number", () => {
+  const source = readCommand("setup.md");
+  assert.match(source, /Pass the id, not the number\./);
+  assert.match(
+    source,
+    /setup --json --review-model mai-code-1-flash-picker --enable-review-gate/,
+    "the worked example must show an id being sent, with other arguments preserved"
+  );
+  assert.equal(
+    /setup --json --review-model 4\b/.test(source),
+    false,
+    "the worked example must no longer forward a bare row number"
   );
 });
 

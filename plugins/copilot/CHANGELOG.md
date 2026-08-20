@@ -3,6 +3,11 @@
 ## Unreleased
 
 Model selection:
+- Commands send a resolved model **id** across process boundaries, never a table row number. A row
+  number is an index into a catalog that can change: anything refreshing the shared roster between
+  the cost guard and the launch it authorised re-numbers the rows, so the same number could price
+  one model and run another. The script still accepts a row number, which is what makes `--model 4`
+  useful directly after `models` in a shell.
 - `/copilot:setup` is now atomic: every requested change is validated before any of them is
   persisted. It previously applied settings as it parsed them, so a command that failed still
   changed configuration — `/copilot:setup --enable-review-gate --model 99` reported an invalid
