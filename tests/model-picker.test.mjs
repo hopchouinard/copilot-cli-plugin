@@ -385,3 +385,96 @@ test("renderModelTable does not shadow the module-level line helper", () => {
   assert.equal(/\bconst line\b/.test(table), false, "inner formatter must not be named `line`");
   assert.equal(/\bconst lines\b/.test(table), false, "inner accumulator must not be named `lines`");
 });
+
+// ---------------------------------------------------------------------------
+// Stop-gate finding: setup persisted unrelated settings before rejecting an
+// invalid model, so a command the user was TOLD had failed still changed
+// configuration. Enabling the review gate that way is the worst case — it
+// starts spending a premium request on every stop.
+// ---------------------------------------------------------------------------
+
+function configSnapshot(cwd) {
+  const { modelCatalog, ...rest } = getConfig(cwd);
+  return rest;
+}
+
+test("a rejected model selection leaves every other setting untouched", async () => {
+  const cwd = tempWorkspace();
+  const before = configSnapshot(cwd);
+
+  await assert.rejects(
+    () =>
+      buildSetupReport(cwd, {
+        "enable-review-gate": true,
+        "cost-warn-threshold": "3",
+        model: "99",
+        refreshCatalog: false
+      }),
+    /Invalid model number/
+  );
+
+  assert.deepEqual(configSnapshot(cwd), before, "a failed setup must not persist any part of the request");
+});
+
+test("a rejected effort leaves the model flags in the same command unapplied", async () => {
+  const cwd = tempWorkspace();
+  const before = configSnapshot(cwd);
+
+  await assert.rejects(
+    () =>
+      buildSetupReport(cwd, {
+        // claude-haiku-4.5 accepts no reasoning effort at all.
+        model: "claude-haiku-4.5",
+        effort: "high",
+        "enable-review-gate": true,
+        refreshCatalog: false
+      }),
+    /claude-haiku-4\.5/
+  );
+
+  assert.deepEqual(configSnapshot(cwd), before);
+});
+
+test("a rejected threshold leaves the gate alone", async () => {
+  const cwd = tempWorkspace();
+  const before = configSnapshot(cwd);
+
+  await assert.rejects(
+    () => buildSetupReport(cwd, { "cost-warn-threshold": "abc", "enable-review-gate": true, refreshCatalog: false }),
+    /Invalid --cost-warn-threshold/
+  );
+
+  assert.deepEqual(configSnapshot(cwd), before);
+});
+
+test("a fully valid command still applies every setting it was given", async () => {
+  const cwd = tempWorkspace();
+
+  const report = await buildSetupReport(cwd, {
+    "enable-review-gate": true,
+    "cost-warn-threshold": "3",
+    model: "6",
+    refreshCatalog: false
+  });
+
+  const config = getConfig(cwd);
+  assert.equal(config.stopReviewGate, true);
+  assert.equal(config.costWarnThreshold, 3);
+  assert.equal(config.reviewModel, "claude-sonnet-4.6");
+  assert.equal(config.taskModel, "claude-sonnet-4.6");
+  assert.equal(report.actionsTaken.length, 3);
+});
+
+test("effort is validated against the model being set, not the one being replaced", async () => {
+  const cwd = tempWorkspace();
+  // Currently on a model that accepts no effort; switching to one that accepts
+  // `max` in the same call must be judged on the incoming model.
+  setConfig(cwd, "reviewModel", "claude-haiku-4.5");
+  setConfig(cwd, "taskModel", "claude-haiku-4.5");
+
+  await buildSetupReport(cwd, { model: "claude-sonnet-4.6", effort: "max", refreshCatalog: false });
+
+  const config = getConfig(cwd);
+  assert.equal(config.reviewModel, "claude-sonnet-4.6");
+  assert.equal(config.effort, "max");
+});

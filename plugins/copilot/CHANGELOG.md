@@ -3,6 +3,13 @@
 ## Unreleased
 
 Model selection:
+- `/copilot:setup` is now atomic: every requested change is validated before any of them is
+  persisted. It previously applied settings as it parsed them, so a command that failed still
+  changed configuration — `/copilot:setup --enable-review-gate --model 99` reported an invalid
+  model and exited non-zero having already turned the review gate on, silently committing the user
+  to a premium request on every stop while telling them the command had failed.
+- `--effort` is validated against the model being set in the same command rather than the one it
+  replaces.
 - `/copilot:setup --model` now shows a numbered table of **every** model in the live catalog,
   cheapest first, marking which models the review and task roles currently use. It replaces a
   four-option `AskUserQuestion` picker that could only ever offer a third of a twelve-model roster,

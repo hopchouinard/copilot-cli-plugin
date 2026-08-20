@@ -88,6 +88,22 @@ export async function buildSetupReport(cwd, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const actionsTaken = [];
 
+  // Every requested change is validated and staged here, and NOTHING is
+  // persisted until all of them pass. Applying them as they were parsed meant
+  // a command that failed still changed settings: `/copilot:setup
+  // --enable-review-gate --model 99` reported "Invalid model number" and
+  // exited non-zero having already turned the review gate ON, so the user was
+  // told the command failed while it had quietly started spending a premium
+  // request on every stop. A rejected command must leave configuration exactly
+  // as it found it.
+  const pending = new Map();
+  const stage = (key, value, note) => {
+    pending.set(key, value);
+    if (note) {
+      actionsTaken.push(note);
+    }
+  };
+
   if (options["cost-warn-threshold"] !== undefined) {
     // Fix: an unparseable value (e.g. "abc") used to serialize to `null`
     // via an unvalidated Number() coercion, which render.mjs then printed
@@ -99,16 +115,13 @@ export async function buildSetupReport(cwd, options = {}) {
         `Invalid --cost-warn-threshold "${options["cost-warn-threshold"]}": expected a number >= 0 (use 0 to disable).`
       );
     }
-    setConfig(workspaceRoot, "costWarnThreshold", threshold);
-    actionsTaken.push(`Set the cost warning threshold to ${threshold}x.`);
+    stage("costWarnThreshold", threshold, `Set the cost warning threshold to ${threshold}x.`);
   }
 
   if (options["enable-review-gate"]) {
-    setConfig(workspaceRoot, "stopReviewGate", true);
-    actionsTaken.push("Enabled the stop-time review gate.");
+    stage("stopReviewGate", true, "Enabled the stop-time review gate.");
   } else if (options["disable-review-gate"]) {
-    setConfig(workspaceRoot, "stopReviewGate", false);
-    actionsTaken.push("Disabled the stop-time review gate.");
+    stage("stopReviewGate", false, "Disabled the stop-time review gate.");
   }
 
   const node = binaryAvailable("node", ["--version"], { cwd });
@@ -121,6 +134,10 @@ export async function buildSetupReport(cwd, options = {}) {
   let config = getConfig(workspaceRoot);
   let modelCatalog = config.modelCatalog;
 
+  // The catalog is a cache with a TTL, not a user setting, and it is refreshed
+  // automatically regardless of what else this call does — so writing it
+  // before the staged settings apply is not partial application of the user's
+  // request, and it avoids throwing away a fetch that was already paid for.
   if (copilot.available && (isCatalogStale(modelCatalog) || options.refreshCatalog)) {
     modelCatalog = await fetchModelCatalog(cwd, options);
     setConfig(workspaceRoot, "modelCatalog", modelCatalog);
@@ -130,11 +147,11 @@ export async function buildSetupReport(cwd, options = {}) {
   const userSettings = readUserSettings();
   const repoSettings = readRepoSettings(workspaceRoot);
 
-  // Applied only after modelCatalog above is final. `--model` may be a table
-  // row number, and resolving it against the pre-refresh ordering could
-  // persist a different model than the row the user read — the one guarantee
-  // the numbering exists to provide. Staleness does not depend on which model
-  // was asked for, so the refresh can safely run first.
+  // Resolved only after modelCatalog above is final. `--model` may be a table
+  // row number, and resolving it against the pre-refresh ordering could stage
+  // a different model than the row the user read — the one guarantee the
+  // numbering exists to provide. Staleness does not depend on which model was
+  // asked for, so the refresh can safely run first.
   for (const [flag, key] of [
     ["model", null],
     ["review-model", "reviewModel"],
@@ -144,21 +161,17 @@ export async function buildSetupReport(cwd, options = {}) {
     if (!value) {
       continue;
     }
-    // Persist the resolved id, never the row number the user typed. A stored
+    // Stage the resolved id, never the row number the user typed. A stored
     // "7" would silently point at a different model the next time the roster
     // changes, which is the whole failure mode the shared ordering avoids.
     const resolved = resolveModelSelection(value, modelCatalog).model;
     if (flag === "model") {
-      setConfig(workspaceRoot, "reviewModel", resolved);
-      setConfig(workspaceRoot, "taskModel", resolved);
-      actionsTaken.push(`Set both review and task models to ${resolved}.`);
+      stage("reviewModel", resolved);
+      stage("taskModel", resolved, `Set both review and task models to ${resolved}.`);
     } else {
-      setConfig(workspaceRoot, key, resolved);
-      actionsTaken.push(`Set ${key} to ${resolved}.`);
+      stage(key, resolved, `Set ${key} to ${resolved}.`);
     }
-    config = getConfig(workspaceRoot);
   }
-
 
   if (options.effort !== undefined) {
     // `effort` is ONE setting shared by both roles, so validating it against
@@ -166,12 +179,30 @@ export async function buildSetupReport(cwd, options = {}) {
     // not accept — after which every review died in validateEffort before it
     // could run, with the failure surfacing far from the setup call that
     // caused it. Both resolved models have to accept it.
+    //
+    // Validated against the PROSPECTIVE config, so a call that sets a model
+    // and an effort together checks the effort against the model being set
+    // rather than the one being replaced.
+    const prospectiveConfig = { ...config, ...Object.fromEntries(pending) };
     for (const role of ["review", "task"]) {
-      const probe = resolveModel({ role, config, env: process.env, repoSettings, userSettings, catalog: modelCatalog });
+      const probe = resolveModel({
+        role,
+        config: prospectiveConfig,
+        env: process.env,
+        repoSettings,
+        userSettings,
+        catalog: modelCatalog
+      });
       validateEffort(probe.model, options.effort, modelCatalog);
     }
-    setConfig(workspaceRoot, "effort", options.effort);
-    actionsTaken.push(`Set the default reasoning effort to ${options.effort}.`);
+    stage("effort", options.effort, `Set the default reasoning effort to ${options.effort}.`);
+  }
+
+  // Everything validated. Only now does anything change.
+  for (const [key, value] of pending) {
+    setConfig(workspaceRoot, key, value);
+  }
+  if (pending.size > 0) {
     config = getConfig(workspaceRoot);
   }
 
