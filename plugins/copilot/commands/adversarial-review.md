@@ -47,6 +47,24 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/copilot-companion.mjs" adversarial-review "$
 - Do not paraphrase, summarize, or add commentary before or after it.
 - Do not fix any issues mentioned in the review output.
 
+Cost guard (background runs only):
+- Before launching in the background, run:
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/scripts/copilot-companion.mjs" cost-check --role review --json
+```
+
+(use `--role task` in `/copilot:rescue`).
+- Always state the returned `label` to the user on the launch line, for example `model  claude-sonnet-4.6 (9x premium)`.
+- If `exceeds` is false, launch without asking.
+- If `exceeds` is true, use `AskUserQuestion` exactly once with three options in this order:
+  - `Run in background` — describe it as "proceed at <label>"
+  - `Switch to <cheapest>` — describe it as "rerun at <cheapestLabel>"
+  - `Cancel`
+- If the user picks the cheaper model, append `--model <cheapest>` to the companion command.
+- If the user cancels, do not launch anything and say so.
+- Foreground runs never ask. State the cost and run.
+
 Background flow:
 - Launch with `Bash(..., run_in_background: true)` using the same command.
 - Do not call `BashOutput` or wait for completion in this turn.

@@ -19,7 +19,14 @@ import {
 } from "./lib/copilot.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
 import { readStoredJob } from "./lib/job-control.mjs";
-import { resolveModel, validateEffort, readUserSettings, readRepoSettings, isCatalogStale } from "./lib/models.mjs";
+import {
+  resolveModel,
+  validateEffort,
+  readUserSettings,
+  readRepoSettings,
+  isCatalogStale,
+  cheapestModel
+} from "./lib/models.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import { binaryAvailable } from "./lib/process.mjs";
 import { renderSetupReport, renderReviewResult, renderTaskResult } from "./lib/render.mjs";
@@ -32,7 +39,7 @@ import {
   createProgressReporter,
   runTrackedJob
 } from "./lib/tracked-jobs.mjs";
-import { describeCost } from "./lib/usage.mjs";
+import { describeCost, exceedsThreshold } from "./lib/usage.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
 const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
@@ -474,6 +481,46 @@ async function handleTaskResumeCandidate(argv) {
   );
 }
 
+export function buildCostCheck(cwd, options = {}) {
+  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  const config = getConfig(workspaceRoot);
+  const catalog = config.modelCatalog;
+
+  const { model, source } = resolveModel({
+    role: options.role === "review" ? "review" : "task",
+    flagModel: options.model,
+    config,
+    env: process.env,
+    repoSettings: readRepoSettings(workspaceRoot),
+    userSettings: readUserSettings()
+  });
+
+  const cost = describeCost(model, catalog);
+  const cheapest = cheapestModel(catalog);
+
+  return {
+    model,
+    source,
+    label: cost.label,
+    multiplier: cost.multiplier,
+    threshold: config.costWarnThreshold,
+    exceeds: exceedsThreshold(model, catalog, config.costWarnThreshold),
+    cheapest,
+    cheapestLabel: cheapest ? describeCost(cheapest, catalog).label : null
+  };
+}
+
+async function handleCostCheck(argv) {
+  const { options } = parseCommandInput(argv, {
+    valueOptions: ["role", "model", "cwd"],
+    booleanOptions: ["json"]
+  });
+
+  const cwd = options.cwd ? path.resolve(process.cwd(), options.cwd) : process.cwd();
+  const check = buildCostCheck(cwd, options);
+  process.stdout.write(`${JSON.stringify(check, null, 2)}\n`);
+}
+
 async function handleReview(argv, config) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["base", "scope", "model", "effort", "cwd"],
@@ -517,6 +564,9 @@ async function main() {
       break;
     case "task-resume-candidate":
       await handleTaskResumeCandidate(argv);
+      break;
+    case "cost-check":
+      await handleCostCheck(argv);
       break;
     default:
       throw new Error(`Unknown subcommand: ${subcommand ?? "(none)"}`);

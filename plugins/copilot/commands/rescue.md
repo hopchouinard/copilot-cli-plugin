@@ -35,6 +35,23 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/copilot-companion.mjs" task-resume-candidate
 - If the user chooses a new session, add `--fresh` before routing to the subagent.
 - If the helper reports `available: false`, do not ask. Route normally.
 
+Cost guard (background runs only):
+- Before launching in the background, run:
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/scripts/copilot-companion.mjs" cost-check --role task --json
+```
+
+- Always state the returned `label` to the user on the launch line, for example `model  claude-sonnet-4.6 (9x premium)`.
+- If `exceeds` is false, launch without asking.
+- If `exceeds` is true, use `AskUserQuestion` exactly once with three options in this order:
+  - `Run in background` — describe it as "proceed at <label>"
+  - `Switch to <cheapest>` — describe it as "rerun at <cheapestLabel>"
+  - `Cancel`
+- If the user picks the cheaper model, append `--model <cheapest>` to the companion command.
+- If the user cancels, do not launch anything and say so.
+- Foreground runs never ask. State the cost and run.
+
 Operating rules:
 
 - The subagent is a thin forwarder only. It should use one `Bash` call to invoke `node "${CLAUDE_PLUGIN_ROOT}/scripts/copilot-companion.mjs" task ...` and return that command's stdout as-is.
