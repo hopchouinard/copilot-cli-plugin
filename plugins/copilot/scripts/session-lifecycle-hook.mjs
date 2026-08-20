@@ -6,13 +6,9 @@ import process from "node:process";
 import { TRANSCRIPT_PATH_ENV } from "./lib/claude-session-transfer.mjs";
 import { terminateProcessTree } from "./lib/process.mjs";
 import { loadState, resolveStateFile, saveState } from "./lib/state.mjs";
+import { SESSION_ID_ENV } from "./lib/tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
-// The Claude Code session id, exported at SessionStart so later companion
-// commands and SessionEnd can find the jobs that belong to this session. This
-// is deliberately distinct from a job's copilotSessionId (the Copilot RPC
-// session, used for `copilot --resume=<id>`) — reaping must key off this one.
-export const SESSION_ID_ENV = "COPILOT_COMPANION_SESSION_ID";
 const PLUGIN_DATA_ENV = "CLAUDE_PLUGIN_DATA";
 
 function readHookInput() {

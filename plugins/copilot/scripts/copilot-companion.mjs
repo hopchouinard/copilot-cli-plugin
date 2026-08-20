@@ -104,8 +104,18 @@ export async function buildSetupReport(cwd, options = {}) {
   }
 
   if (options["cost-warn-threshold"] !== undefined) {
-    setConfig(workspaceRoot, "costWarnThreshold", Number(options["cost-warn-threshold"]));
-    actionsTaken.push(`Set the cost warning threshold to ${options["cost-warn-threshold"]}x.`);
+    // Fix: an unparseable value (e.g. "abc") used to serialize to `null`
+    // via an unvalidated Number() coercion, which render.mjs then printed
+    // as "warn  disabled" while actionsTaken reported success — silently
+    // turning off the money guard instead of rejecting the bad input.
+    const threshold = Number(options["cost-warn-threshold"]);
+    if (!Number.isFinite(threshold) || threshold < 0) {
+      throw new Error(
+        `Invalid --cost-warn-threshold "${options["cost-warn-threshold"]}": expected a number >= 0 (use 0 to disable).`
+      );
+    }
+    setConfig(workspaceRoot, "costWarnThreshold", threshold);
+    actionsTaken.push(`Set the cost warning threshold to ${threshold}x.`);
   }
 
   if (options["enable-review-gate"]) {
@@ -397,6 +407,43 @@ function enqueueBackgroundTask(cwd, workspaceRoot, options, prompt, resumeLast) 
   return queuedRecord;
 }
 
+// Fix M1: every documented rescue flow lands in the foreground path —
+// commands/rescue.md and the copilot-cli-runtime skill both instruct the
+// subagent to strip --background before calling `task`, so enqueueBackgroundTask
+// below is effectively unreachable in practice. This routes the foreground
+// path through the same job-tracking machinery handleReview uses
+// (runTrackedJob), so a foreground rescue run appears in /copilot:status,
+// can be interrupted by /copilot:cancel, and its spend reaches the session
+// total — previously this path called executeTask directly with no job
+// record at all. Exported (mirroring executeTask/executeTransfer) so tests
+// can exercise the tracking wiring directly with an injected fixture binary.
+export async function executeTrackedTask(cwd, options = {}) {
+  const { prompt = "", resumeLast = false } = options;
+  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  const write = Boolean(options.write);
+  const job = createJobRecord({
+    id: generateJobId("task"),
+    kind: "task",
+    kindLabel: "rescue",
+    title: "Copilot Task",
+    workspaceRoot,
+    jobClass: "task",
+    summary: prompt || (resumeLast ? "Resume previous task" : "Task"),
+    write
+  });
+  const logFile = createJobLogFile(job.workspaceRoot, job.id, job.title);
+  const onProgress = createProgressReporter({
+    logFile,
+    onEvent: createJobProgressUpdater(workspaceRoot, job.id)
+  });
+
+  return runTrackedJob(
+    { ...job, logFile },
+    () => executeTask(cwd, { ...options, prompt, resumeLast, onProgress }),
+    { logFile }
+  );
+}
+
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["model", "effort", "cwd"],
@@ -422,11 +469,7 @@ async function handleTask(argv) {
     return;
   }
 
-  const execution = await executeTask(cwd, {
-    ...options,
-    prompt,
-    resumeLast
-  });
+  const execution = await executeTrackedTask(cwd, { ...options, prompt, resumeLast });
   process.stdout.write(options.json ? `${JSON.stringify(execution.payload, null, 2)}\n` : execution.rendered);
   if (execution.exitStatus !== 0) {
     process.exitCode = execution.exitStatus;

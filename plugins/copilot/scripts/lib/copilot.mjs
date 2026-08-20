@@ -22,17 +22,83 @@ const NOT_INSTALLED =
 // rather than a single hardcoded string.
 const PERMISSION_REQUEST_METHOD_PATTERN = /permission|confirm|approv/i;
 
+// Spec §6.3 layer 3 calls for "denying anything not on an explicit read
+// allowlist" — not a blanket deny for every read-only permission request.
+// git.mjs's self-collect path (git.mjs:8, >2 files) routes Copilot through
+// exactly this: it is told to inspect the diff itself with read-only git
+// commands, and a blanket deny turns that into a confident, paid review of
+// a bare file list the model never actually read. This is deliberately a
+// narrow, conservative allowlist of inspection commands rather than an
+// attempt to sandbox arbitrary shell — anything that doesn't unambiguously
+// match falls through to deny, which is the pre-existing, safe behaviour.
+const READ_ONLY_COMMAND_ALLOWLIST =
+  /^(git\s+(status|diff|log|show|ls-files)\b|ls|cat|rg|grep|find|head|tail|wc)(\s|$)/;
+
+// Chaining/redirection characters that could smuggle a write past a command
+// that otherwise starts with an allowed read-only verb (e.g.
+// "git status; rm -rf ."). Any of these forces a deny regardless of the
+// leading command.
+const SHELL_CHAIN_PATTERN = /[;&|`]|\$\(|>/;
+
+// The exact params shape a server permission request carries for a shell/
+// tool command was never confirmed against the real protocol (see the
+// PERMISSION_REQUEST_METHOD_PATTERN comment above), so this probes a small
+// set of plausible field paths rather than assuming one. It returns a
+// command string only when it finds one unambiguously; any shape it doesn't
+// recognise returns null, which callers must treat as "cannot identify the
+// command" — degrading to deny, never to allow.
+function extractRequestedCommand(params) {
+  if (!params || typeof params !== "object") {
+    return null;
+  }
+  const candidates = [
+    params.command,
+    params.input?.command,
+    params.arguments?.command,
+    params.toolCall?.arguments?.command,
+    params.tool?.input?.command,
+    params.parameters?.command
+  ];
+  for (const candidate of candidates) {
+    if (typeof candidate === "string" && candidate.trim()) {
+      return candidate.trim();
+    }
+    if (Array.isArray(candidate) && candidate.length > 0 && candidate.every((part) => typeof part === "string")) {
+      const joined = candidate.join(" ").trim();
+      if (joined) {
+        return joined;
+      }
+    }
+  }
+  return null;
+}
+
+function isAllowedReadOnlyCommand(command) {
+  if (typeof command !== "string" || !command.trim()) {
+    return false;
+  }
+  const trimmed = command.trim();
+  if (SHELL_CHAIN_PATTERN.test(trimmed)) {
+    return false;
+  }
+  return READ_ONLY_COMMAND_ALLOWLIST.test(trimmed);
+}
+
 // Answers a server permission request per spec §6.3 layer 3
-// ("deny-by-default permissions"): deny for a read-only turn, allow for a
-// write-capable one. The exact expected reply shape is unconfirmed against
-// the real protocol (see the comment above), so this returns several
-// differently-named boolean/string fields that cover the plausible shapes
-// (`decision`, `approved`, `allow`, `behavior`) — harmless extra keys in a
-// JSON-RPC result are ignored by a spec-conformant server, but a *missing*
-// key the server actually reads would silently misbehave, which this hedges
-// against until a live run confirms the real shape.
-function buildPermissionResponse(readOnly) {
-  const allow = !readOnly;
+// ("deny-by-default permissions... denying anything not on an explicit read
+// allowlist"): a write-capable turn always allows; a read-only turn allows
+// only when the requested command can be confidently identified and matches
+// the read-only allowlist above, and denies otherwise (including when the
+// command can't be identified at all — see extractRequestedCommand). The
+// exact expected reply shape is unconfirmed against the real protocol (see
+// the comment above), so this returns several differently-named
+// boolean/string fields that cover the plausible shapes (`decision`,
+// `approved`, `allow`, `behavior`) — harmless extra keys in a JSON-RPC
+// result are ignored by a spec-conformant server, but a *missing* key the
+// server actually reads would silently misbehave, which this hedges against
+// until a live run confirms the real shape.
+function buildPermissionResponse(readOnly, params) {
+  const allow = !readOnly || isAllowedReadOnlyCommand(extractRequestedCommand(params));
   return {
     decision: allow ? "allow" : "deny",
     approved: allow,
@@ -60,7 +126,7 @@ function createServerRequestHandler({ readOnly, onProgress }) {
       throw new Error(`Unsupported server request: ${method}`);
     }
 
-    return buildPermissionResponse(readOnly);
+    return buildPermissionResponse(readOnly, params);
   };
 }
 
@@ -344,15 +410,28 @@ export async function runCopilotTurn(cwd, options = {}) {
     client.setServerRequestHandler(createServerRequestHandler({ readOnly: Boolean(options.readOnly), onProgress: options.onProgress }));
 
     if (resuming) {
-      emit(options.onProgress, `Resuming session ${sessionId}.`, "starting");
+      // Fix M2/M3: emit copilotSessionId alongside the progress message so
+      // it reaches the job record (tracked-jobs.mjs's progress updater only
+      // writes copilotSessionId when a progress event carries one) — without
+      // it, /copilot:cancel's interruptCopilotTurn call is always a no-op
+      // during a running job. Also pass model/reasoningEffort on resume,
+      // mirroring the create branch below: a previous ruling verified
+      // against the real Copilot CLI that session.resume accepts these
+      // extra params without error, and render.mjs prints the resolved
+      // model's multiplier regardless of which branch ran, so omitting them
+      // here silently billed at the resumed session's original model while
+      // printing the multiplier for whatever --model was requested instead.
+      emit(options.onProgress, `Resuming session ${sessionId}.`, "starting", { copilotSessionId: sessionId });
       await client.request("session.resume", {
         sessionId,
         workingDirectory: cwd,
+        model: options.model,
+        ...(options.effort ? { reasoningEffort: options.effort } : {}),
         ...(options.readOnly ? { excludedTools: READ_ONLY_EXCLUDED_TOOLS } : {}),
         requestPermission: Boolean(options.readOnly)
       });
     } else {
-      emit(options.onProgress, "Creating Copilot session.", "starting");
+      emit(options.onProgress, "Creating Copilot session.", "starting", { copilotSessionId: sessionId });
       await client.request("session.create", {
         sessionId,
         workingDirectory: cwd,

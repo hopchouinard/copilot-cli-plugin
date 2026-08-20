@@ -16,7 +16,6 @@ function normalizeProgressEvent(value) {
       phase: typeof value.phase === "string" && value.phase.trim() ? value.phase.trim() : null,
       copilotSessionId:
         typeof value.copilotSessionId === "string" && value.copilotSessionId.trim() ? value.copilotSessionId.trim() : null,
-      turnId: typeof value.turnId === "string" && value.turnId.trim() ? value.turnId.trim() : null,
       stderrMessage: value.stderrMessage == null ? null : String(value.stderrMessage).trim(),
       logTitle: typeof value.logTitle === "string" && value.logTitle.trim() ? value.logTitle.trim() : null,
       logBody: value.logBody == null ? null : String(value.logBody).trimEnd()
@@ -27,7 +26,6 @@ function normalizeProgressEvent(value) {
     message: String(value ?? "").trim(),
     phase: null,
     copilotSessionId: null,
-    turnId: null,
     stderrMessage: String(value ?? "").trim(),
     logTitle: null,
     logBody: null
@@ -71,7 +69,6 @@ export function createJobRecord(base, options = {}) {
 export function createJobProgressUpdater(workspaceRoot, jobId) {
   let lastPhase = null;
   let lastCopilotSessionId = null;
-  let lastTurnId = null;
 
   return (event) => {
     const normalized = normalizeProgressEvent(event);
@@ -87,12 +84,6 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
     if (normalized.copilotSessionId && normalized.copilotSessionId !== lastCopilotSessionId) {
       lastCopilotSessionId = normalized.copilotSessionId;
       patch.copilotSessionId = normalized.copilotSessionId;
-      changed = true;
-    }
-
-    if (normalized.turnId && normalized.turnId !== lastTurnId) {
-      lastTurnId = normalized.turnId;
-      patch.turnId = normalized.turnId;
       changed = true;
     }
 
@@ -160,7 +151,6 @@ export async function runTrackedJob(job, runner, options = {}) {
       ...runningRecord,
       status: completionStatus,
       copilotSessionId: execution.sessionId ?? null,
-      turnId: execution.turnId ?? null,
       pid: null,
       phase: completionStatus === "completed" ? "done" : "failed",
       completedAt,
@@ -172,7 +162,6 @@ export async function runTrackedJob(job, runner, options = {}) {
       id: job.id,
       status: completionStatus,
       copilotSessionId: execution.sessionId ?? null,
-      turnId: execution.turnId ?? null,
       summary: execution.summary,
       phase: completionStatus === "completed" ? "done" : "failed",
       pid: null,

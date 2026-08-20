@@ -54,6 +54,7 @@ Cost guard (background runs only):
 node "${CLAUDE_PLUGIN_ROOT}/scripts/copilot-companion.mjs" cost-check --role review --json
 ```
 
+- If the raw arguments include `--model <id>`, forward the same `--model <id>` to `cost-check` above so the guard checks the model the run will actually use, not the configured default.
 (use `--role task` in `/copilot:rescue`).
 - Always state the returned `label` to the user on the launch line, for example `model  claude-sonnet-4.6 (9x premium)`.
 - If `exceeds` is false, launch without asking.

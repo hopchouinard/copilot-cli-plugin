@@ -233,9 +233,14 @@ export function buildTranscriptDigest(jsonlPath) {
     }
   }
 
-  const goal = userMessages.find(Boolean) ?? "(no user message found)";
-  const decisions = assistantMessages.slice(-5);
-  const openThreads = userMessages.slice(-1);
+  // A pasted credential shows up in a user message (the goal, a follow-up
+  // instruction) or an assistant message (a decision) far more often than
+  // in a recorded Bash command — redactCredentials previously covered only
+  // `commands`, leaving these three to ship a secret verbatim into the
+  // Copilot prompt and the on-disk transfer payload.
+  const goal = redactCredentials(userMessages.find(Boolean) ?? "(no user message found)");
+  const decisions = assistantMessages.slice(-5).map(redactCredentials);
+  const openThreads = userMessages.slice(-1).map(redactCredentials);
 
   const markdown = [
     "# Transferred Claude Code session",
