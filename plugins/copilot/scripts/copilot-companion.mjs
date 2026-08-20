@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
@@ -16,11 +18,20 @@ import {
   DEFAULT_CONTINUE_PROMPT
 } from "./lib/copilot.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
+import { readStoredJob } from "./lib/job-control.mjs";
 import { resolveModel, validateEffort, readUserSettings, readRepoSettings, isCatalogStale } from "./lib/models.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
-import { getConfig, setConfig } from "./lib/state.mjs";
 import { binaryAvailable } from "./lib/process.mjs";
 import { renderSetupReport, renderReviewResult, renderTaskResult } from "./lib/render.mjs";
+import { generateJobId, getConfig, setConfig, upsertJob, writeJobFile } from "./lib/state.mjs";
+import {
+  appendLogLine,
+  createJobLogFile,
+  createJobProgressUpdater,
+  createJobRecord,
+  createProgressReporter,
+  runTrackedJob
+} from "./lib/tracked-jobs.mjs";
 import { describeCost } from "./lib/usage.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
@@ -232,13 +243,21 @@ export async function executeTask(cwd, options = {}) {
   });
   const effort = validateEffort(model, options.effort ?? config.effort, catalog);
 
-  let sessionId = null;
+  // A background job pre-mints its Copilot sessionId at enqueue time (see
+  // handleTask's --background branch) so /copilot:cancel can interrupt it
+  // before the worker has reported a single progress event. That id is
+  // distinct from --resume-last, which looks up an *existing* session to
+  // continue; a preset id here is a brand-new session Copilot has never
+  // seen, just with a caller-chosen id.
+  let sessionId = options.sessionId ?? null;
+  let resumedExisting = false;
   if (options.resumeLast) {
     const latest = await findLatestTaskSession(workspaceRoot, options);
     if (!latest) {
       throw new Error("No previous Copilot task session was found for this repository.");
     }
     sessionId = latest.sessionId;
+    resumedExisting = true;
   }
 
   if (!options.prompt && !sessionId) {
@@ -248,11 +267,11 @@ export async function executeTask(cwd, options = {}) {
   const result = await runCopilotTurn(workspaceRoot, {
     sessionId,
     prompt: options.prompt,
-    defaultPrompt: sessionId ? DEFAULT_CONTINUE_PROMPT : "",
+    defaultPrompt: resumedExisting ? DEFAULT_CONTINUE_PROMPT : "",
     model,
     effort,
     readOnly: !options.write,
-    sessionName: sessionId ? null : buildTaskSessionName(options.prompt),
+    sessionName: resumedExisting ? null : buildTaskSessionName(options.prompt),
     onProgress: options.onProgress,
     binary: options.binary,
     env: options.env
@@ -275,6 +294,67 @@ export async function executeTask(cwd, options = {}) {
   };
 }
 
+function spawnDetachedTaskWorker(cwd, jobId) {
+  const scriptPath = path.join(ROOT_DIR, "scripts", "copilot-companion.mjs");
+  const child = spawn(process.execPath, [scriptPath, "task-worker", "--cwd", cwd, "--job-id", jobId], {
+    cwd,
+    env: process.env,
+    detached: true,
+    stdio: "ignore",
+    windowsHide: true
+  });
+  child.unref();
+  return child;
+}
+
+function enqueueBackgroundTask(cwd, workspaceRoot, options, prompt, resumeLast) {
+  // Mint the Copilot sessionId now, before the worker process exists, so a
+  // stored-but-not-yet-running job still carries the id /copilot:cancel
+  // needs to interrupt it (spec §6.6 / §3.2).
+  const sessionId = randomUUID();
+  const write = Boolean(options.write);
+
+  const job = {
+    ...createJobRecord({
+      id: generateJobId("task"),
+      kind: "task",
+      kindLabel: "rescue",
+      title: "Copilot Task",
+      workspaceRoot,
+      jobClass: "task",
+      summary: prompt || (resumeLast ? "Resume previous task" : "Task"),
+      write
+    }),
+    sessionId
+  };
+
+  const logFile = createJobLogFile(job.workspaceRoot, job.id, job.title);
+  appendLogLine(logFile, "Queued for background execution.");
+
+  const request = {
+    model: options.model,
+    effort: options.effort,
+    prompt,
+    write,
+    resumeLast,
+    sessionId
+  };
+
+  const child = spawnDetachedTaskWorker(cwd, job.id);
+  const queuedRecord = {
+    ...job,
+    status: "queued",
+    phase: "queued",
+    pid: child.pid ?? null,
+    logFile,
+    request
+  };
+  writeJobFile(job.workspaceRoot, job.id, queuedRecord);
+  upsertJob(job.workspaceRoot, queuedRecord);
+
+  return queuedRecord;
+}
+
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["model", "effort", "cwd"],
@@ -283,16 +363,76 @@ async function handleTask(argv) {
 
   const cwd = options.cwd ? path.resolve(process.cwd(), options.cwd) : process.cwd();
   const prompt = positionals.join(" ").trim();
+  const resumeLast = Boolean(options["resume-last"]);
+
+  if (options.background) {
+    if (!prompt && !resumeLast) {
+      throw new Error("Provide a prompt, a prompt file, piped stdin, or use --resume-last.");
+    }
+    const workspaceRoot = resolveWorkspaceRoot(cwd);
+    const job = enqueueBackgroundTask(cwd, workspaceRoot, options, prompt, resumeLast);
+    const rendered = `${job.title} started in the background as ${job.id}. Check /copilot:status ${job.id} for progress.\n`;
+    process.stdout.write(
+      options.json
+        ? `${JSON.stringify({ jobId: job.id, status: "queued", sessionId: job.sessionId }, null, 2)}\n`
+        : rendered
+    );
+    return;
+  }
 
   const execution = await executeTask(cwd, {
     ...options,
     prompt,
-    resumeLast: Boolean(options["resume-last"])
+    resumeLast
   });
   process.stdout.write(options.json ? `${JSON.stringify(execution.payload, null, 2)}\n` : execution.rendered);
   if (execution.exitStatus !== 0) {
     process.exitCode = execution.exitStatus;
   }
+}
+
+async function handleTaskWorker(argv) {
+  const { options } = parseCommandInput(argv, {
+    valueOptions: ["cwd", "job-id"]
+  });
+
+  if (!options["job-id"]) {
+    throw new Error("Missing required --job-id for task-worker.");
+  }
+
+  const cwd = options.cwd ? path.resolve(process.cwd(), options.cwd) : process.cwd();
+  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  const storedJob = readStoredJob(workspaceRoot, options["job-id"]);
+  if (!storedJob) {
+    throw new Error(`No stored job found for ${options["job-id"]}.`);
+  }
+
+  const request = storedJob.request;
+  if (!request || typeof request !== "object") {
+    throw new Error(`Stored job ${options["job-id"]} is missing its task request payload.`);
+  }
+
+  const logFile = storedJob.logFile ?? createJobLogFile(workspaceRoot, storedJob.id, storedJob.title);
+  const onProgress = createProgressReporter({
+    logFile,
+    onEvent: createJobProgressUpdater(workspaceRoot, storedJob.id)
+  });
+
+  await runTrackedJob(
+    { ...storedJob, workspaceRoot, logFile },
+    async () => {
+      // The worker must reuse the pre-minted sessionId carried on the
+      // stored job/request rather than letting executeTask mint a second
+      // one, or a cancel issued before this line would target an id the
+      // worker never actually uses.
+      const execution = await executeTask(workspaceRoot, { ...request, onProgress });
+      // executeTask does not produce a `summary` (unlike the reference
+      // Codex runner); preserve the summary set at enqueue time instead of
+      // letting runTrackedJob's upsertJob patch blank it out with undefined.
+      return { ...execution, summary: storedJob.summary };
+    },
+    { logFile }
+  );
 }
 
 export async function findTaskResumeCandidate(cwd, options = {}) {
@@ -360,6 +500,9 @@ async function main() {
       break;
     case "task":
       await handleTask(argv);
+      break;
+    case "task-worker":
+      await handleTaskWorker(argv);
       break;
     case "task-resume-candidate":
       await handleTaskResumeCandidate(argv);
