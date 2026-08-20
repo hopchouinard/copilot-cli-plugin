@@ -13,7 +13,16 @@ import { sortJobsNewestFirst } from "./lib/job-control.mjs";
 import { SESSION_ID_ENV } from "./lib/tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
-const STOP_REVIEW_TIMEOUT_MS = 15 * 60 * 1000;
+// hooks.json declares the Stop hook's own timeout at 900s (15 min). This
+// inner spawnSync timeout must leave real margin under that: after
+// spawnSync returns (or is killed), this process still has to log premium
+// usage, build the JSON decision payload, and flush stdout — and everything
+// before spawnSync (reading stdin, resolving the workspace, the auth check)
+// already ate into the outer budget. Setting this equal to the outer
+// timeout means a genuine timeout reads as "no decision" (an unintended
+// allow) instead of a block, which is the one failure mode the gate exists
+// to avoid.
+const STOP_REVIEW_TIMEOUT_MS = 14 * 60 * 1000;
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(SCRIPT_DIR, "..");
 
@@ -202,7 +211,16 @@ async function main() {
 
 if (import.meta.url === `file://${process.argv[1]}`) {
   main().catch((error) => {
-    process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+    // A gate whose failure mode is silent-allow is not a gate: an unrelated
+    // internal crash (bad hook input, a state-file read failure, anything
+    // before runStopReview) must still block, not just log and exit non-zero
+    // with no decision on stdout.
+    const message = error instanceof Error ? error.message : String(error);
+    process.stderr.write(`${message}\n`);
+    emitDecision({
+      decision: "block",
+      reason: `The stop-time review gate hit an unexpected internal error and cannot confirm the previous turn is safe to stop on: ${message}`
+    });
     process.exitCode = 1;
   });
 }

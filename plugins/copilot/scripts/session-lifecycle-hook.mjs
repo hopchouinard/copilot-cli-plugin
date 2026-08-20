@@ -46,16 +46,19 @@ function cleanupSessionJobs(cwd, sessionId) {
   }
 
   const state = loadState(workspaceRoot);
-  const removedJobs = state.jobs.filter((job) => job.sessionId === sessionId);
-  if (removedJobs.length === 0) {
+  // Only jobs that are BOTH this session's AND still queued/running are
+  // reaped. Finished, failed, and cancelled jobs for this session stay in
+  // state — they are exactly what /copilot:result and the 50-job history cap
+  // exist to hold, and their results become unrecoverable the moment their
+  // job/log files are pruned by saveState below.
+  const reapableJobs = state.jobs.filter(
+    (job) => job.sessionId === sessionId && (job.status === "queued" || job.status === "running")
+  );
+  if (reapableJobs.length === 0) {
     return;
   }
 
-  for (const job of removedJobs) {
-    const stillRunning = job.status === "queued" || job.status === "running";
-    if (!stillRunning) {
-      continue;
-    }
+  for (const job of reapableJobs) {
     try {
       terminateProcessTree(job.pid ?? Number.NaN);
     } catch {
@@ -64,10 +67,12 @@ function cleanupSessionJobs(cwd, sessionId) {
   }
 
   // saveState prunes files for any job no longer present in the retained
-  // list, so dropping these jobs here also deletes their job/log files.
+  // list, so dropping only the reaped jobs here also deletes only their
+  // job/log files.
+  const reapedIds = new Set(reapableJobs.map((job) => job.id));
   saveState(workspaceRoot, {
     ...state,
-    jobs: state.jobs.filter((job) => job.sessionId !== sessionId)
+    jobs: state.jobs.filter((job) => !reapedIds.has(job.id))
   });
 }
 
