@@ -28,6 +28,18 @@ export const DEFAULT_CONTINUE_PROMPT =
 // self-collect reviews outright rather than sandbox them.
 const READ_ONLY_EXCLUDED_TOOLS = ["create", "edit"];
 const INFERRED_COMPLETION_MS = 250;
+
+// C1 fix: a final backstop against a turn hanging forever with the Copilot
+// process alive but silent — no more events, no exit, no error. The
+// primary bounds on `await capture.promise` are session.idle,
+// scheduleInferredCompletion's message-gated timer, the "error" event
+// above, and the client's exitPromise (raced in runCopilotTurn below); this
+// is the last line of defence when none of those ever fire. 15 minutes is
+// deliberately generous — a real review/task turn can legitimately run
+// long — the point is only that SOME ceiling exists, not that it's tight.
+// Overridable via options.absoluteTimeoutMs so tests can exercise it
+// without actually waiting 15 minutes.
+const DEFAULT_ABSOLUTE_TURN_TIMEOUT_MS = 15 * 60 * 1000;
 const NOT_INSTALLED =
   "GitHub Copilot CLI is not installed or is too old. Install it with `npm install -g @github/copilot`, then rerun `/copilot:setup`.";
 
@@ -58,14 +70,33 @@ const PERMISSION_REQUEST_METHOD_PATTERN = /permission|confirm|approv/i;
 // narrow, conservative allowlist of inspection commands rather than an
 // attempt to sandbox arbitrary shell — anything that doesn't unambiguously
 // match falls through to deny, which is the pre-existing, safe behaviour.
+// Anchored at BOTH ends (`^...$`) so a match proves the ENTIRE trimmed
+// command string is one allowlisted invocation, not merely that it starts
+// with one. An earlier version anchored only `^`, matched with `.test()`,
+// and never required the rest of the string to be consumed — `.test()`
+// only needs a match somewhere at position 0, so anything after a
+// recognised "verb + separator" prefix went completely unexamined. Because
+// `\s` matches a literal newline, "git status\nrm -rf /" satisfied that
+// old pattern outright: a documented, verified live bypass (a re-review
+// confirmed it against this exact regex). The argument tail is
+// deliberately restricted to a charset that excludes every character
+// SHELL_CHAIN_PATTERN denies below, so the two checks agree by
+// construction instead of by two independently-maintained lists.
 const READ_ONLY_COMMAND_ALLOWLIST =
-  /^(git\s+(status|diff|log|show|ls-files)\b|ls|cat|rg|grep|find|head|tail|wc)(\s|$)/;
+  /^(git\s+(status|diff|log|show|ls-files)\b|ls\b|cat\b|rg\b|grep\b|find\b|head\b|tail\b|wc\b)(\s[^\x00-\x1f;&|`<>\\]*)?$/;
 
-// Chaining/redirection characters that could smuggle a write past a command
-// that otherwise starts with an allowed read-only verb (e.g.
-// "git status; rm -rf ."). Any of these forces a deny regardless of the
-// leading command.
-const SHELL_CHAIN_PATTERN = /[;&|`]|\$\(|>/;
+// Characters that could separate, chain, redirect, or otherwise smuggle a
+// second command past an allowlisted-looking prefix (e.g.
+// "git status; rm -rf ." or "git status\nrm -rf /"). This deliberately
+// includes every C0 control character (`\x00`-`\x1f`), not just the
+// obviously shell-special ones: `\s` in READ_ONLY_COMMAND_ALLOWLIST treats
+// a literal newline or carriage return as an ordinary separator, which a
+// live re-review confirmed was exploitable to run an unreviewed second
+// command in read-only mode ("git status\nrm -rf /" was being approved).
+// Any of these forces a deny regardless of the leading command — prefer a
+// false deny (cheap: the model just gets refused and can retry with a
+// simpler command) to a false approval (not cheap: it runs).
+const SHELL_CHAIN_PATTERN = /[\x00-\x1f;&|`<>\\]|\$\(/;
 
 // The exact params shape a server permission request carries for a shell/
 // tool command was never confirmed against the real protocol (see the
@@ -496,8 +527,23 @@ function applyEvent(capture, event) {
       }
       break;
     case "error":
+      // C1 fix: an `error` event is a genuine, terminal end to the turn —
+      // no further assistant.message, assistant.turn_end, or session.idle
+      // is coming after it. The pre-existing code recorded capture.error
+      // but never resolved the capture, so a round that produced no
+      // assistant.message (e.g. self-collect's tool-only round 1) followed
+      // by an error hung forever: neither of the two things that can
+      // settle capture.promise (session.idle, or scheduleInferredCompletion's
+      // message-gated timer) would ever fire. Resolve here so the turn
+      // fails loudly (status 1, via capture.error below) instead of
+      // hanging silently.
       capture.error = data;
       emit(capture.onProgress, `Copilot error: ${data.message ?? "unknown"}`, "failed");
+      clearTimeout(capture.timer);
+      if (!capture.completed) {
+        capture.completed = true;
+        capture.resolve();
+      }
       break;
     case "session.info":
       // Fix 2 (permission-fix wave): configuration-category session.info
@@ -654,7 +700,53 @@ export async function runCopilotTurn(cwd, options = {}) {
     }
     capture.buffered.length = 0;
 
-    await capture.promise;
+    // C1 fix: `await capture.promise` alone has no bound. Before this fix,
+    // the only two things that could ever settle it were session.idle and
+    // scheduleInferredCompletion's message-gated 250ms timer — a round
+    // that produces no assistant.message (self-collect's tool-only round 1
+    // is exactly this) followed by a dropped connection or the copilot
+    // process dying left the turn suspended forever, with no timeout, no
+    // abort, and no reference from rpc-client.mjs's handleExit back to
+    // this promise at all. Racing client.exitPromise closes that hole: it
+    // resolves the moment the child process actually exits or errors (see
+    // rpc-client.mjs), independent of anything session-event-based. The
+    // absolute-ceiling timer is the final backstop for a process that
+    // stays alive but goes silent — see DEFAULT_ABSOLUTE_TURN_TIMEOUT_MS.
+    const absoluteTimeoutMs = options.absoluteTimeoutMs ?? DEFAULT_ABSOLUTE_TURN_TIMEOUT_MS;
+    let absoluteTimeoutHandle;
+    const absoluteTimeout = new Promise((resolve) => {
+      absoluteTimeoutHandle = setTimeout(() => resolve({ outcome: "timed-out" }), absoluteTimeoutMs);
+      absoluteTimeoutHandle.unref?.();
+    });
+
+    const settled = await Promise.race([
+      capture.promise.then(() => ({ outcome: "completed" })),
+      client.exitPromise.then((failure) => ({ outcome: "exited", failure })),
+      absoluteTimeout
+    ]);
+    clearTimeout(absoluteTimeoutHandle);
+
+    if (settled.outcome !== "completed" && !capture.completed) {
+      capture.completed = true;
+      clearTimeout(capture.timer);
+      if (settled.outcome === "exited") {
+        const detail = settled.failure instanceof Error ? settled.failure.message : String(settled.failure);
+        emit(options.onProgress, `Copilot connection ended before the turn completed: ${detail}`, "failed");
+        capture.error = capture.error ?? { message: `Copilot connection ended before the turn completed: ${detail}` };
+      } else if (settled.outcome === "timed-out") {
+        emit(
+          options.onProgress,
+          `Copilot turn exceeded its ${absoluteTimeoutMs}ms absolute ceiling without completing.`,
+          "failed"
+        );
+        capture.error = capture.error ?? {
+          message: `Copilot turn exceeded its ${absoluteTimeoutMs}ms absolute ceiling without completing.`
+        };
+        // The process is still alive and unresponsive — don't leave it
+        // running after we've given up waiting on it.
+        await client.forceKillProcess().catch(() => {});
+      }
+    }
 
     // Drain any permission replies still in flight (see
     // pendingPermissionReplies above) before touching the client again —

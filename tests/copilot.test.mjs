@@ -229,6 +229,86 @@ test(
   }
 );
 
+// Regression coverage for a Critical found on re-review (C1): before this
+// fix, the only two things that could ever settle `capture.promise` were
+// session.idle and scheduleInferredCompletion's message-gated 250ms timer.
+// A round that produces no assistant.message — self-collect's tool-only
+// round 1, exactly the scenario above — followed by an error, a dropped
+// connection, or the copilot process dying, hung forever with no bound
+// anywhere in the call chain. These three tests cover each of those
+// termination paths.
+test(
+  "a mid-turn error event resolves the run instead of hanging when no message was ever seen",
+  { timeout: 5000 },
+  async () => {
+    const result = await runCopilotTurn(process.cwd(), {
+      prompt: "review this",
+      model: "claude-haiku-4.5",
+      readOnly: true,
+      ...withScenario({
+        events: [
+          { type: "assistant.turn_start", data: {} },
+          { type: "command.execute", data: { command: "git diff" } },
+          { type: "error", data: { message: "model call failed" } }
+          // Deliberately no turn_end, no session.idle, and no
+          // assistant.message — the exact combination that used to hang.
+        ]
+      })
+    });
+    assert.equal(result.status, 1, "an error must surface as a failed status, not an empty success");
+    assert.equal(result.error?.message, "model call failed");
+  }
+);
+
+test(
+  "the copilot process dying mid-turn resolves the run instead of hanging when no message was ever seen",
+  { timeout: 5000 },
+  async () => {
+    const capture = withCaptureScenario({
+      crashAfterSend: true,
+      events: [
+        { type: "assistant.turn_start", data: {} },
+        { type: "command.execute", data: { command: "git diff" } }
+        // No message, no turn_end, no idle — then the fixture process
+        // itself exits (see fake-copilot-fixture.mjs's crashAfterSend),
+        // simulating a crashed/killed real Copilot CLI.
+      ]
+    });
+    const result = await runCopilotTurn(process.cwd(), {
+      prompt: "review this",
+      model: "claude-haiku-4.5",
+      readOnly: true,
+      ...capture
+    });
+    assert.equal(result.status, 1, "a dead connection must surface as a failed status, not an empty success");
+    assert.ok(result.error?.message, "expected an error describing the dropped connection");
+  }
+);
+
+test(
+  "a turn that goes completely silent is bounded by the absolute timeout backstop",
+  { timeout: 5000 },
+  async () => {
+    const capture = withCaptureScenario({
+      neverComplete: true,
+      events: [{ type: "assistant.turn_start", data: {} }]
+      // The fixture process stays alive and never sends anything else —
+      // no message, no turn_end, no idle, no error, no exit. Only the
+      // absolute-ceiling timer (forced tiny here via absoluteTimeoutMs) can
+      // still bound this.
+    });
+    const result = await runCopilotTurn(process.cwd(), {
+      prompt: "review this",
+      model: "claude-haiku-4.5",
+      readOnly: true,
+      absoluteTimeoutMs: 100,
+      ...capture
+    });
+    assert.equal(result.status, 1, "a silent turn must fail loudly once the absolute ceiling is hit, not hang");
+    assert.ok(/absolute ceiling/.test(result.error?.message ?? ""), "expected the timeout's own error message");
+  }
+);
+
 // Regression coverage for the read-only permission deadlock found in Task
 // 16 acceptance testing: the real Copilot CLI sends a server→client request
 // when a read-only session (`requestPermission: true`) wants to run a tool,
@@ -385,6 +465,49 @@ test(
     assert.equal(reply.params.result.kind, "reject", "a chained command must not ride through on its allowlisted prefix");
   }
 );
+
+// Regression coverage for a Critical found on re-review: the allowlist regex
+// used `.test()` anchored only at `^`, never at `$`, and `\s` (which the
+// allowlist used for "verb followed by anything") matches a literal
+// newline. "git status\nrm -rf /" was therefore approved outright in
+// read-only mode — a live-verified bypass. The fix anchors the allowlist at
+// both ends and denies every C0 control character (not just the
+// shell-special ones) up front. These cover the reported bypass plus
+// neighbouring shapes that rely on the same "something after a recognised
+// prefix goes unexamined" class of mistake.
+for (const [label, fullCommandText] of [
+  ["a bare LF between two commands", "git status\nrm -rf /"],
+  ["a CRLF between two commands", "git status\r\nrm -rf /"],
+  ["input redirection", "git status < /etc/passwd"],
+  ["a trailing backslash", "git status \\"],
+  ["a command name with a bogus suffix", "git statusx"]
+]) {
+  test(
+    `a permission.requested event for ${label} is denied under read-only posture`,
+    { timeout: 5000 },
+    async () => {
+      const capture = withCaptureScenario({
+        permissionEvent: {
+          requestId: `perm-bypass-${label}`,
+          permissionRequest: { kind: "shell", fullCommandText, intention: "inspect" }
+        }
+      });
+      const result = await runCopilotTurn(process.cwd(), {
+        prompt: "review this",
+        model: "claude-haiku-4.5",
+        readOnly: true,
+        ...capture
+      });
+      assert.equal(result.status, 0, "the turn must complete rather than hang even on a denial");
+
+      const reply = readCapturedCalls(capture.capturePath).find(
+        (call) => call.method === "session.permissions.handlePendingPermissionRequest"
+      );
+      assert.ok(reply);
+      assert.equal(reply.params.result.kind, "reject", `${JSON.stringify(fullCommandText)} must not be approved`);
+    }
+  );
+}
 
 test(
   "a permission.requested event for a non-shell kind is denied under read-only posture",

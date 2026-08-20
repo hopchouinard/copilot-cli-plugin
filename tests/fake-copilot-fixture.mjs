@@ -163,6 +163,36 @@ const handlers = {
           }
         });
       }
+      // C1 regression coverage: lets a scenario simulate the copilot
+      // process dying mid-turn (crash, kill -9, connection drop — anything
+      // that ends the child without ever sending a formal completion
+      // event). `events` (if given) plays out first — typically a
+      // message-less, tool-only round, mirroring self-collect's round 1 —
+      // then the fixture process itself exits, which is exactly what
+      // rpc-client.mjs's `proc.on("exit"/"error")` → handleExit() observes
+      // for a real crashed CLI. The delay before exit gives the (POSIX
+      // pipe, therefore asynchronous) stdout write of those events time to
+      // actually reach the parent before the process is gone.
+      if (scenario.crashAfterSend) {
+        for (const event of scenario.events ?? []) {
+          emitEvent(params.sessionId, { id: `evt-${Math.random().toString(36).slice(2)}`, ...event });
+        }
+        setTimeout(() => process.exit(scenario.crashExitCode ?? 1), 50);
+        return;
+      }
+
+      // C1 regression coverage: lets a scenario simulate a turn that goes
+      // completely silent — the process stays alive, but no further events
+      // ever arrive and it never exits either. Exercises the absolute-
+      // ceiling backstop in runCopilotTurn (options.absoluteTimeoutMs),
+      // which is the only thing that can still bound a turn in this case.
+      if (scenario.neverComplete) {
+        for (const event of scenario.events ?? []) {
+          emitEvent(params.sessionId, { id: `evt-${Math.random().toString(36).slice(2)}`, ...event });
+        }
+        return;
+      }
+
       replayEvents(params.sessionId);
     });
     return { messageId: "msg-1" };

@@ -95,6 +95,22 @@ test("request after an unexpected child exit rejects rather than writing to dead
   await client.close();
 });
 
+// Regression coverage for the C1 fix in copilot.mjs: runCopilotTurn races
+// `capture.promise` against `client.exitPromise` so a copilot process that
+// dies mid-turn (with no formal completion event ever sent) still bounds
+// the turn instead of hanging forever. That race needs exitPromise to
+// actually resolve — with the failure, so the caller can report why —
+// rather than staying pending or resolving with nothing useful.
+test("exitPromise resolves with the failure when the child exits unexpectedly", async () => {
+  const client = await CopilotRpcClient.connect(process.cwd(), { binary: STUB_CRASH });
+  // Trigger the crash (the stub exits on any request after connect).
+  await assert.rejects(() => client.request("ping", {}), /exited unexpectedly/);
+  const failure = await client.exitPromise;
+  assert.ok(failure instanceof Error, "expected exitPromise to resolve with the Error, not undefined");
+  assert.match(failure.message, /exited unexpectedly/);
+  await client.close();
+});
+
 test("the handshake-refusal path leaves no live child process", async () => {
   const pidFile = path.join(os.tmpdir(), `copilot-stub-pid-${process.pid}-${Date.now()}`);
   await assert.rejects(

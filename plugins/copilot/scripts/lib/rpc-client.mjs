@@ -214,11 +214,18 @@ export class CopilotRpcClient {
     }
     this.exitResolved = true;
     const failure = error ?? new Error("copilot connection closed.");
+    // Resolve exitPromise WITH the failure (rather than no value) so a
+    // caller racing it — as runCopilotTurn now does, per the C1 fix for
+    // the "process dies mid-turn with no completion event" hang — can
+    // report why the turn ended rather than just that it did. close()'s
+    // own await of exitPromise ignores the resolved value, so this is
+    // additive: nothing that previously consumed exitPromise breaks.
+    this.exitError = failure;
     for (const pending of this.pending.values()) {
       pending.reject(failure);
     }
     this.pending.clear();
-    this.resolveExit();
+    this.resolveExit(failure);
   }
 
   setNotificationHandler(handler) {
