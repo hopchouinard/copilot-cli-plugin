@@ -20,6 +20,15 @@ function tempWorkspace() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "copilot-ws-"));
 }
 
+// Plants ~/.copilot/settings.json under the HOME that tempWorkspace() just
+// isolated, so a test can make the task/review model arrive via
+// "user-settings" instead of plugin config.
+function plantUserSettings(settings) {
+  const dir = path.join(process.env.HOME, ".copilot");
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, "settings.json"), JSON.stringify(settings), "utf8");
+}
+
 test("setup reports auth and caches the model catalog", async () => {
   const cwd = tempWorkspace();
   const report = await buildSetupReport(cwd, { binary: FIXTURE });
@@ -52,4 +61,20 @@ test("setup rejects an effort the chosen model does not support", async () => {
     () => buildSetupReport(cwd, { binary: FIXTURE, effort: "high" }),
     /does not support reasoning effort/
   );
+});
+
+test("setup validates --effort against the task model resolved from user settings, not the config-less fallback", async () => {
+  const cwd = tempWorkspace();
+  // No taskModel in plugin config, no COPILOT_MODEL env, no repo settings —
+  // the task model can only be found by reading ~/.copilot/settings.json.
+  plantUserSettings({ model: "claude-sonnet-4.6" });
+
+  const report = await buildSetupReport(cwd, { binary: FIXTURE, effort: "high" });
+
+  // If the effort probe resolved the task model without repoSettings/userSettings,
+  // it would fall through to "auto" (which supports no reasoning effort) and
+  // this would reject instead of succeeding.
+  assert.equal(report.resolved.task.model, "claude-sonnet-4.6");
+  assert.equal(report.resolved.task.source, "user-settings");
+  assert.equal(report.resolved.effort, "high");
 });

@@ -73,16 +73,17 @@ export async function buildSetupReport(cwd, options = {}) {
     config = getConfig(workspaceRoot);
   }
 
+  const userSettings = readUserSettings();
+  const repoSettings = readRepoSettings(workspaceRoot);
+
   if (options.effort !== undefined) {
-    const probe = resolveModel({ role: "task", config, env: process.env });
+    const probe = resolveModel({ role: "task", config, env: process.env, repoSettings, userSettings });
     validateEffort(probe.model, options.effort, modelCatalog);
     setConfig(workspaceRoot, "effort", options.effort);
     actionsTaken.push(`Set the default reasoning effort to ${options.effort}.`);
     config = getConfig(workspaceRoot);
   }
 
-  const userSettings = readUserSettings();
-  const repoSettings = readRepoSettings(workspaceRoot);
   const resolved = {
     review: resolveModel({ role: "review", config, env: process.env, repoSettings, userSettings }),
     task: resolveModel({ role: "task", config, env: process.env, repoSettings, userSettings }),
