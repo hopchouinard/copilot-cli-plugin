@@ -7,20 +7,21 @@ allowed-tools: Bash(node:*), Bash(npm:*), AskUserQuestion
 Raw slash-command arguments:
 `$ARGUMENTS`
 
-Before running anything, check the raw arguments for a bare model flag with no id after it — `--model`, `--review-model`, or `--task-model`, either as the last token or immediately followed by another `--flag`. The underlying script rejects a valueless flag outright (it throws `Missing value for --model` before any of your logic below can run), so this must be handled here first, without ever passing that bare flag through:
+Before running anything, check the raw arguments for a bare model flag with no id after it — `--model`, `--review-model`, or `--task-model`, either as the last token or immediately followed by another `--flag`. The underlying script rejects a valueless flag outright (it throws `Missing value for --model` before any of your logic below can run), so this must be handled here first, without ever passing that bare flag through. Call the flag you found `<bare-flag>`; you must reuse that exact flag later, because `--model` sets both roles while `--review-model` and `--task-model` each set only one — substituting `--model` would silently change a role the user did not ask about.
 
-- Run the model table, with every bare model flag removed and every other argument kept:
+- Run the model table. Forward `--cwd <dir>` if the original arguments carried one; `--cwd` is the only other option this subcommand takes.
 
 ```bash
 node "${CLAUDE_PLUGIN_ROOT}/scripts/copilot-companion.mjs" models
 ```
 
-- Show that table to the user **exactly as returned**. It is already numbered, sorted cheapest first, and marks which models the review and task roles currently use. Do not rebuild it, truncate it, or re-order it, and do not use `AskUserQuestion` — the whole point of the table is that it lists every model, and an `AskUserQuestion` caps at four options.
-- Then stop and let the user answer. Ask them which model they want, naming the flag being set (for `--review-model` say it applies to reviews only; for `--task-model`, rescue and transfer runs; for `--model`, both).
-- When they reply, pass their answer straight through as the flag value:
+- **If the output says no model catalog is cached**, there is nothing to pick from — this is a first run, or Copilot is unreachable. Do not show it and do not ask. Drop `<bare-flag>` from the arguments entirely, continue with the normal setup flow below including the install and authentication steps, and once setup reports Copilot is ready, run the `models` command again and resume this picker. If Copilot still is not ready, say so and stop; a model cannot be chosen without a roster.
+- Otherwise show the table to the user **exactly as returned**. It is already numbered, sorted cheapest first, and marks which models the review and task roles currently use. Do not rebuild it, truncate it, or re-order it, and do not use `AskUserQuestion` — the whole point of the table is that it lists every model, and an `AskUserQuestion` caps at four options.
+- Then stop and let the user answer. Ask them which model they want, naming what `<bare-flag>` will change: `--review-model` affects reviews only, `--task-model` affects rescue and transfer runs, `--model` affects both.
+- When they reply, rebuild the original argument list with `<bare-flag>` given their answer as its value and every other original argument preserved, then continue below with that. For example, if the user ran `/copilot:setup --review-model --enable-review-gate` and answered `4`:
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/copilot-companion.mjs" setup --json --model <their answer>
+node "${CLAUDE_PLUGIN_ROOT}/scripts/copilot-companion.mjs" setup --json --review-model 4 --enable-review-gate
 ```
 
   The script resolves a row number or a model id itself, using the same ordering the table was numbered with, so forward what they typed verbatim rather than mapping it to an id yourself. If they typed something invalid the script reports the valid range — show that and ask again.

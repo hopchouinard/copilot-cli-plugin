@@ -263,3 +263,125 @@ test("every cost-guard command offers the full roster, not only the cheapest mod
     assert.match(source, /caps at four options/, `${name} must explain why a second picker is wrong`);
   }
 });
+
+// ---------------------------------------------------------------------------
+// PR #2 review: a row number must be resolved against the catalog the caller
+// ends up using, never against a stale one that is about to be replaced.
+// Otherwise the guard prices row N from the old ordering while the run that
+// follows resolves row N from the new one.
+// ---------------------------------------------------------------------------
+
+// Deliberately a DIFFERENT ordering from CATALOG: row 2 is the cheapest model
+// here but an expensive one there, so resolving against the wrong catalog
+// produces a visibly wrong answer rather than a coincidentally right one.
+const REFRESHED_MODELS = [
+  { id: "brand-new-cheap", billing: { multiplier: 0.1 }, capabilities: {} },
+  { id: "brand-new-costly", billing: { multiplier: 20 }, capabilities: {} },
+  { id: "claude-haiku-4.5", billing: { multiplier: 0.33 }, capabilities: {} }
+];
+
+function staleCatalogWorkspace() {
+  const cwd = tempWorkspace();
+  setConfig(cwd, "modelCatalog", {
+    models: [
+      { id: "old-cheap", multiplier: 0.5, reasoningEfforts: [] },
+      { id: "old-costly", multiplier: 30, reasoningEfforts: [] }
+    ],
+    cachedAt: "2020-01-01T00:00:00.000Z"
+  });
+  return cwd;
+}
+
+test("the cost guard resolves a row number against the refreshed catalog, not the stale one", async () => {
+  const cwd = staleCatalogWorkspace();
+
+  // Row 2 of the STALE ordering is `old-costly` (30x); row 2 of the REFRESHED
+  // ordering is `claude-haiku-4.5` (0.33x). Resolving before the refresh would
+  // price 30x and then run something else entirely.
+  const check = await buildCostCheck(cwd, { role: "review", model: "2", ...withScenario({ models: REFRESHED_MODELS }) });
+
+  assert.equal(check.catalogRefreshed, true);
+  assert.equal(check.model, "claude-haiku-4.5", "row 2 must name the row 2 of the catalog actually in force");
+  assert.equal(check.multiplier, 0.33);
+});
+
+test("the model the cost guard priced is the model a later run resolves to", async () => {
+  const cwd = staleCatalogWorkspace();
+
+  const check = await buildCostCheck(cwd, { role: "review", model: "2", ...withScenario({ models: REFRESHED_MODELS }) });
+  // The refreshed catalog is persisted, so this is what the review would see.
+  const afterwards = resolveModel({
+    role: "review",
+    flagModel: "2",
+    config: getConfig(cwd),
+    catalog: getConfig(cwd).modelCatalog
+  });
+
+  assert.equal(afterwards.model, check.model, "the guard priced a different model than the run would use");
+});
+
+test("setup resolves a row number against the refreshed catalog before persisting it", async () => {
+  const cwd = staleCatalogWorkspace();
+
+  await buildSetupReport(cwd, { model: "1", ...withScenario({ models: REFRESHED_MODELS }) });
+
+  const config = getConfig(cwd);
+  assert.equal(config.reviewModel, "brand-new-cheap", "row 1 of the stale catalog was `old-cheap`");
+  assert.equal(config.taskModel, "brand-new-cheap");
+});
+
+test("an id-only selection still triggers the absent-model refresh", async () => {
+  const cwd = tempWorkspace();
+  const check = await buildCostCheck(cwd, {
+    role: "review",
+    model: "brand-new-costly",
+    ...withScenario({ models: REFRESHED_MODELS })
+  });
+  assert.equal(check.catalogRefreshed, true);
+  assert.equal(check.multiplier, 20);
+  assert.equal(check.exceeds, true);
+});
+
+// ---------------------------------------------------------------------------
+// PR #2 review: setup.md must preserve the role-specific flag and must not
+// deadlock when there is no catalog to pick from.
+// ---------------------------------------------------------------------------
+
+test("setup.md reuses the bare flag it detected rather than substituting --model", () => {
+  const source = readCommand("setup.md");
+  assert.match(source, /<bare-flag>/, "setup.md must carry the detected flag forward by name");
+  assert.match(
+    source,
+    /substituting `--model` would silently change a role the user did not ask about/,
+    "setup.md must say why the flag cannot be swapped for --model"
+  );
+  assert.match(
+    source,
+    /setup --json --review-model 4/,
+    "the worked example must show a role-specific flag surviving, not --model"
+  );
+});
+
+test("setup.md forwards --cwd to the models subcommand", () => {
+  assert.match(readCommand("setup.md"), /Forward `--cwd <dir>`/);
+});
+
+test("setup.md continues to install and auth when there is no catalog to pick from", () => {
+  const source = readCommand("setup.md");
+  assert.match(
+    source,
+    /If the output says no model catalog is cached/,
+    "setup.md must handle an empty roster instead of stopping for an answer that cannot be given"
+  );
+  assert.match(source, /continue with the normal setup flow below including the install and authentication steps/);
+});
+
+test("renderModelTable does not shadow the module-level line helper", () => {
+  const source = fs.readFileSync(
+    path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "plugins", "copilot", "scripts", "lib", "render.mjs"),
+    "utf8"
+  );
+  const table = source.slice(source.indexOf("export function renderModelTable"), source.indexOf("const SEVERITY_ORDER"));
+  assert.equal(/\bconst line\b/.test(table), false, "inner formatter must not be named `line`");
+  assert.equal(/\bconst lines\b/.test(table), false, "inner accumulator must not be named `lines`");
+});

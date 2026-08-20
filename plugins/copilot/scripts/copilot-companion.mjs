@@ -88,29 +88,6 @@ export async function buildSetupReport(cwd, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const actionsTaken = [];
 
-  for (const [flag, key] of [
-    ["model", null],
-    ["review-model", "reviewModel"],
-    ["task-model", "taskModel"]
-  ]) {
-    const value = options[flag];
-    if (!value) {
-      continue;
-    }
-    // Persist the resolved id, never the row number the user typed. A stored
-    // "7" would silently point at a different model the next time the roster
-    // changes, which is the whole failure mode the shared ordering avoids.
-    const resolved = resolveModelSelection(value, getConfig(workspaceRoot).modelCatalog).model;
-    if (flag === "model") {
-      setConfig(workspaceRoot, "reviewModel", resolved);
-      setConfig(workspaceRoot, "taskModel", resolved);
-      actionsTaken.push(`Set both review and task models to ${resolved}.`);
-    } else {
-      setConfig(workspaceRoot, key, resolved);
-      actionsTaken.push(`Set ${key} to ${resolved}.`);
-    }
-  }
-
   if (options["cost-warn-threshold"] !== undefined) {
     // Fix: an unparseable value (e.g. "abc") used to serialize to `null`
     // via an unvalidated Number() coercion, which render.mjs then printed
@@ -152,6 +129,36 @@ export async function buildSetupReport(cwd, options = {}) {
 
   const userSettings = readUserSettings();
   const repoSettings = readRepoSettings(workspaceRoot);
+
+  // Applied only after modelCatalog above is final. `--model` may be a table
+  // row number, and resolving it against the pre-refresh ordering could
+  // persist a different model than the row the user read — the one guarantee
+  // the numbering exists to provide. Staleness does not depend on which model
+  // was asked for, so the refresh can safely run first.
+  for (const [flag, key] of [
+    ["model", null],
+    ["review-model", "reviewModel"],
+    ["task-model", "taskModel"]
+  ]) {
+    const value = options[flag];
+    if (!value) {
+      continue;
+    }
+    // Persist the resolved id, never the row number the user typed. A stored
+    // "7" would silently point at a different model the next time the roster
+    // changes, which is the whole failure mode the shared ordering avoids.
+    const resolved = resolveModelSelection(value, modelCatalog).model;
+    if (flag === "model") {
+      setConfig(workspaceRoot, "reviewModel", resolved);
+      setConfig(workspaceRoot, "taskModel", resolved);
+      actionsTaken.push(`Set both review and task models to ${resolved}.`);
+    } else {
+      setConfig(workspaceRoot, key, resolved);
+      actionsTaken.push(`Set ${key} to ${resolved}.`);
+    }
+    config = getConfig(workspaceRoot);
+  }
+
 
   if (options.effort !== undefined) {
     // `effort` is ONE setting shared by both roles, so validating it against
@@ -633,25 +640,22 @@ export async function buildCostCheck(cwd, options = {}) {
   const config = getConfig(workspaceRoot);
   let catalog = config.modelCatalog;
 
-  const { model, source } = resolveModel({
-    role: options.role === "review" ? "review" : "task",
-    flagModel: options.model,
-    config,
-    env: process.env,
-    repoSettings: readRepoSettings(workspaceRoot),
-    userSettings: readUserSettings(),
-    catalog
-  });
-
   // This is the last checkpoint before a paid background run, and it was
   // pricing that run off whatever the cache happened to hold: a catalog past
   // its TTL, or one that predates the model the user just named. Both make
   // describeCost report "cost unknown", and an unknown multiplier used to
   // make exceedsThreshold return false — the expensive-run confirmation was
-  // skipped precisely when the plugin knew least about the cost. Refresh
-  // first when the cache cannot answer for this model.
+  // skipped precisely when the plugin knew least about the cost.
+  //
+  // A stale catalog is refreshed BEFORE anything is resolved. `--model` may be
+  // a table row number, and resolving it against the old ordering and then
+  // persisting a new one means the review that follows resolves the same
+  // number against a DIFFERENT ordering — pricing one model and running
+  // another, with `exceeds` computed for the wrong one. Staleness does not
+  // depend on which model was asked for, so this check needs no resolution to
+  // run first.
   let catalogRefreshed = false;
-  if (options.refreshCatalog !== false && (isCatalogStale(catalog) || !catalogHasModel(model, catalog))) {
+  const refreshCatalog = async () => {
     try {
       catalog = await fetchModelCatalog(cwd, options);
       setConfig(workspaceRoot, "modelCatalog", catalog);
@@ -661,6 +665,32 @@ export async function buildCostCheck(cwd, options = {}) {
       // unknown-cost branch below is the fail-safe.
       catalog = config.modelCatalog;
     }
+  };
+
+  const resolveAgainstCatalog = () =>
+    resolveModel({
+      role: options.role === "review" ? "review" : "task",
+      flagModel: options.model,
+      config,
+      env: process.env,
+      repoSettings: readRepoSettings(workspaceRoot),
+      userSettings: readUserSettings(),
+      catalog
+    });
+
+  if (options.refreshCatalog !== false && isCatalogStale(catalog)) {
+    await refreshCatalog();
+  }
+
+  let { model, source } = resolveAgainstCatalog();
+
+  // A model the roster cannot price is the second reason to refresh, and it
+  // can only be discovered after resolution. Re-resolve afterwards so the
+  // returned model always comes from the catalog this function priced against
+  // — the invariant the row numbering depends on.
+  if (options.refreshCatalog !== false && !catalogRefreshed && !catalogHasModel(model, catalog)) {
+    await refreshCatalog();
+    ({ model, source } = resolveAgainstCatalog());
   }
 
   const cost = describeCost(model, catalog);

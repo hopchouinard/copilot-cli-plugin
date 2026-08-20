@@ -89,7 +89,7 @@ export function renderModelTable(catalog, options = {}) {
   const costWidth = width("cost", "COST");
   const effortsWidth = width("efforts", "EFFORT LEVELS");
 
-  const line = (number, id, cost, efforts, mark) =>
+  const formatRow = (number, id, cost, efforts, mark) =>
     [
       number.padStart(numberWidth),
       id.padEnd(idWidth),
@@ -102,14 +102,14 @@ export function renderModelTable(catalog, options = {}) {
       .trimEnd();
 
   const anyInUse = rows.some((row) => row.inUse);
-  const lines = [line("#", "MODEL", "COST", "EFFORT LEVELS", anyInUse ? "IN USE" : "")];
+  const tableLines = [formatRow("#", "MODEL", "COST", "EFFORT LEVELS", anyInUse ? "IN USE" : "")];
   for (const row of rows) {
-    lines.push(line(row.number, row.id, row.cost, row.efforts, anyInUse ? row.inUse : ""));
+    tableLines.push(formatRow(row.number, row.id, row.cost, row.efforts, anyInUse ? row.inUse : ""));
   }
 
-  lines.push("");
-  lines.push(`Reply with a number (1-${rows.length}) or a model id.`);
-  return `${lines.join("\n")}\n`;
+  tableLines.push("");
+  tableLines.push(`Reply with a number (1-${rows.length}) or a model id.`);
+  return `${tableLines.join("\n")}\n`;
 }
 
 const SEVERITY_ORDER = { critical: 0, high: 1, medium: 2, low: 3 };
