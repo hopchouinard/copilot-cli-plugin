@@ -123,4 +123,71 @@ export function renderTaskResult(result, options = {}) {
   return `${lines.join("\n")}\n`;
 }
 
+export function renderStatusReport(report) {
+  const rows = [
+    "| job | kind | status | phase | premium | summary |",
+    "| --- | --- | --- | --- | --- | --- |"
+  ];
+
+  for (const job of report.jobs ?? []) {
+    const premium = typeof job.usage?.premiumRequests === "number" ? String(job.usage.premiumRequests) : "-";
+    rows.push(
+      `| ${job.id} | ${job.kindLabel ?? job.kind ?? "-"} | ${job.status} | ${job.phase ?? "-"} | ${premium} | ${job.summary ?? "-"} |`
+    );
+  }
+
+  if ((report.jobs ?? []).length === 0) {
+    rows.push("| - | - | - | - | - | no jobs for this session |");
+  }
+
+  const lines = [rows.join("\n")];
+  if (report.usageTotal) {
+    lines.push("");
+    lines.push(
+      `Session total: ${report.usageTotal.premiumRequests} premium request${report.usageTotal.premiumRequests === 1 ? "" : "s"} across ${report.usageTotal.jobs} job${report.usageTotal.jobs === 1 ? "" : "s"}.`
+    );
+  }
+
+  return `${lines.join("\n")}\n`;
+}
+
+export function renderJobStatusReport(job) {
+  const lines = [`# ${job.title ?? job.id}`, ""];
+  lines.push(`id      ${job.id}`);
+  lines.push(`status  ${job.status}`);
+  lines.push(`phase   ${job.phase ?? "-"}`);
+  if (job.sessionId) {
+    lines.push(`session ${job.sessionId}`);
+  }
+  const usageLine = formatUsage(job.usage);
+  if (usageLine) {
+    lines.push(`usage   ${usageLine}`);
+  }
+  if (job.errorMessage) {
+    lines.push("");
+    lines.push(`Error: ${job.errorMessage}`);
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+export function renderStoredJobResult(job, storedJob) {
+  if (!storedJob?.rendered) {
+    return renderJobStatusReport(job);
+  }
+  const usageLine = formatUsage(storedJob.usage ?? job.usage);
+  const suffix = usageLine ? `\nusage  ${usageLine}\n` : "";
+  // The resume line must use the Copilot RPC session id (copilotSessionId),
+  // never the Claude Code session id (sessionId) that job filtering keys
+  // off of — crossing them is the exact defect this project has already
+  // shipped once (see job-control.mjs / tracked-jobs.mjs comments).
+  const resume = job.copilotSessionId
+    ? `\nResume in Copilot: copilot --resume=${job.copilotSessionId}\n`
+    : "";
+  return `${storedJob.rendered}${suffix}${resume}`;
+}
+
+export function renderCancelReport(job) {
+  return `Cancelled ${job.id} (${job.title ?? job.kind ?? "job"}).\n`;
+}
+
 export { formatUsage };

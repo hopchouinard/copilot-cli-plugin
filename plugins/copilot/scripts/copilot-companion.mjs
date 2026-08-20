@@ -15,10 +15,17 @@ import {
   parseStructuredOutput,
   buildTaskSessionName,
   findLatestTaskSession,
+  interruptCopilotTurn,
   DEFAULT_CONTINUE_PROMPT
 } from "./lib/copilot.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
-import { readStoredJob } from "./lib/job-control.mjs";
+import {
+  buildStatusSnapshot,
+  buildSingleJobSnapshot,
+  resolveResultJob,
+  resolveCancelableJob,
+  readStoredJob
+} from "./lib/job-control.mjs";
 import {
   resolveModel,
   validateEffort,
@@ -28,8 +35,16 @@ import {
   cheapestModel
 } from "./lib/models.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
-import { binaryAvailable } from "./lib/process.mjs";
-import { renderSetupReport, renderReviewResult, renderTaskResult } from "./lib/render.mjs";
+import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
+import {
+  renderSetupReport,
+  renderReviewResult,
+  renderTaskResult,
+  renderStatusReport,
+  renderJobStatusReport,
+  renderStoredJobResult,
+  renderCancelReport
+} from "./lib/render.mjs";
 import { generateJobId, getConfig, setConfig, upsertJob, writeJobFile } from "./lib/state.mjs";
 import {
   appendLogLine,
@@ -521,6 +536,72 @@ async function handleCostCheck(argv) {
   process.stdout.write(`${JSON.stringify(check, null, 2)}\n`);
 }
 
+async function handleStatus(argv) {
+  const { options, positionals } = parseCommandInput(argv, {
+    valueOptions: ["cwd"],
+    booleanOptions: ["json", "all"]
+  });
+
+  const cwd = options.cwd ? path.resolve(process.cwd(), options.cwd) : process.cwd();
+  const reference = positionals.join(" ").trim();
+
+  if (reference) {
+    const { job } = buildSingleJobSnapshot(cwd, reference);
+    process.stdout.write(options.json ? `${JSON.stringify(job, null, 2)}\n` : renderJobStatusReport(job));
+    return;
+  }
+
+  const report = buildStatusSnapshot(cwd, { all: Boolean(options.all) });
+  process.stdout.write(options.json ? `${JSON.stringify(report, null, 2)}\n` : renderStatusReport(report));
+}
+
+async function handleResult(argv) {
+  const { options, positionals } = parseCommandInput(argv, {
+    valueOptions: ["cwd"],
+    booleanOptions: ["json"]
+  });
+
+  const cwd = options.cwd ? path.resolve(process.cwd(), options.cwd) : process.cwd();
+  const reference = positionals.join(" ").trim();
+
+  const { workspaceRoot, job } = resolveResultJob(cwd, reference);
+  const storedJob = readStoredJob(workspaceRoot, job.id);
+
+  process.stdout.write(
+    options.json ? `${JSON.stringify({ job, storedJob }, null, 2)}\n` : renderStoredJobResult(job, storedJob)
+  );
+}
+
+async function handleCancel(argv) {
+  const { options, positionals } = parseCommandInput(argv, {
+    valueOptions: ["cwd"],
+    booleanOptions: ["json"]
+  });
+
+  const cwd = options.cwd ? path.resolve(process.cwd(), options.cwd) : process.cwd();
+  const reference = positionals.join(" ").trim();
+
+  const { workspaceRoot, job } = resolveCancelableJob(cwd, reference);
+
+  // Interrupt the remote Copilot turn *before* killing the local worker
+  // process — otherwise Copilot keeps burning premium requests on work
+  // nobody is going to read after the worker is already dead.
+  await interruptCopilotTurn(workspaceRoot, { sessionId: job.copilotSessionId });
+  terminateProcessTree(job.pid);
+
+  const completedAt = new Date().toISOString();
+  const cancelledPatch = { id: job.id, status: "cancelled", phase: "cancelled", pid: null, completedAt };
+  upsertJob(workspaceRoot, cancelledPatch);
+
+  const storedJob = readStoredJob(workspaceRoot, job.id);
+  if (storedJob) {
+    writeJobFile(workspaceRoot, job.id, { ...storedJob, ...cancelledPatch });
+  }
+
+  const cancelledJob = { ...job, ...cancelledPatch };
+  process.stdout.write(options.json ? `${JSON.stringify(cancelledJob, null, 2)}\n` : renderCancelReport(cancelledJob));
+}
+
 async function handleReview(argv, config) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["base", "scope", "model", "effort", "cwd"],
@@ -567,6 +648,15 @@ async function main() {
       break;
     case "cost-check":
       await handleCostCheck(argv);
+      break;
+    case "status":
+      await handleStatus(argv);
+      break;
+    case "result":
+      await handleResult(argv);
+      break;
+    case "cancel":
+      await handleCancel(argv);
       break;
     default:
       throw new Error(`Unknown subcommand: ${subcommand ?? "(none)"}`);
