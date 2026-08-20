@@ -197,4 +197,32 @@ export function renderCancelReport(job) {
   return `Cancelled ${job.id} (${job.title ?? job.kind ?? "job"}).\n`;
 }
 
+export function renderTransferResult(result, options = {}) {
+  const lines = [
+    "# Copilot session transfer",
+    "",
+    "This is a **primer**, not replayed turn history. GitHub Copilot CLI has no",
+    "session-import API, so the Claude Code conversation was condensed into a",
+    "briefing and sent as the opening message of a new Copilot session. Copilot",
+    "does not know your prior turns beyond what that briefing describes.",
+    "",
+    `model  ${describeCost(options.model, options.catalog).label}`
+  ];
+  const usageLine = formatUsage(result.usage);
+  if (usageLine) {
+    lines.push(`usage  ${usageLine}`);
+  }
+  lines.push("");
+  lines.push(`Copilot session ID: ${result.sessionId}`);
+  lines.push("");
+  lines.push("Resume it with:");
+  lines.push("");
+  lines.push(`  copilot --resume=${result.sessionId}`);
+  lines.push("");
+  lines.push("Copilot's acknowledgment:");
+  lines.push("");
+  lines.push(result.finalMessage || "(no acknowledgment captured)");
+  return `${lines.join("\n")}\n`;
+}
+
 export { formatUsage };

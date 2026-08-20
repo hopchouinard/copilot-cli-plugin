@@ -18,6 +18,7 @@ import {
   interruptCopilotTurn,
   DEFAULT_CONTINUE_PROMPT
 } from "./lib/copilot.mjs";
+import { buildTranscriptDigest, resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
 import {
   buildStatusSnapshot,
@@ -43,7 +44,8 @@ import {
   renderStatusReport,
   renderJobStatusReport,
   renderStoredJobResult,
-  renderCancelReport
+  renderCancelReport,
+  renderTransferResult
 } from "./lib/render.mjs";
 import { generateJobId, getConfig, setConfig, upsertJob, writeJobFile } from "./lib/state.mjs";
 import {
@@ -627,6 +629,86 @@ async function handleReview(argv, config) {
   }
 }
 
+export async function executeTransfer(cwd, options = {}) {
+  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  const config = getConfig(workspaceRoot);
+  const catalog = config.modelCatalog;
+
+  const jsonlPath = resolveClaudeSessionPath(cwd, { source: options.source });
+  const digest = buildTranscriptDigest(jsonlPath);
+
+  const { model } = resolveModel({
+    role: "task",
+    flagModel: options.model,
+    config,
+    env: process.env,
+    repoSettings: readRepoSettings(workspaceRoot),
+    userSettings: readUserSettings()
+  });
+  const effort = validateEffort(model, options.effort ?? config.effort, catalog);
+
+  // Mint a brand-new Copilot session id for the transfer and pass it as
+  // newSessionId (session.create), never as sessionId (session.resume) —
+  // this id has never existed in Copilot before this call, and the real
+  // Copilot CLI rejects session.resume for an id it never created (verified
+  // against 1.0.80: "Session not found"). See runCopilotTurn in
+  // lib/copilot.mjs for the same distinction on the background-task path.
+  const copilotSessionId = randomUUID();
+
+  const prompt = `${digest.markdown}\n\nAcknowledge that you've received this briefing, then wait for further instructions from the user before taking any action.`;
+
+  const result = await runCopilotTurn(workspaceRoot, {
+    newSessionId: copilotSessionId,
+    prompt,
+    model,
+    effort,
+    readOnly: true,
+    sessionName: "Transferred Claude Code session",
+    onProgress: options.onProgress,
+    binary: options.binary,
+    env: options.env
+  });
+
+  return {
+    exitStatus: result.status,
+    // result.sessionId is what runCopilotTurn actually used when talking to
+    // Copilot (it echoes back options.newSessionId here) — printing that,
+    // rather than the copilotSessionId variable above, guarantees the id in
+    // the resume command is the one Copilot will actually accept even if
+    // this function's minting logic ever changes.
+    copilotSessionId: result.sessionId,
+    payload: {
+      model,
+      effort,
+      copilotSessionId: result.sessionId,
+      resumeCommand: `copilot --resume=${result.sessionId}`,
+      source: jsonlPath,
+      goal: digest.goal,
+      filesTouched: digest.filesTouched,
+      commands: digest.commands,
+      acknowledgment: result.finalMessage,
+      mode: result.mode,
+      usage: result.usage
+    },
+    rendered: renderTransferResult(result, { model, catalog }),
+    usage: result.usage
+  };
+}
+
+async function handleTransfer(argv) {
+  const { options } = parseCommandInput(argv, {
+    valueOptions: ["cwd", "source", "model", "effort"],
+    booleanOptions: ["json"]
+  });
+
+  const cwd = options.cwd ? path.resolve(process.cwd(), options.cwd) : process.cwd();
+  const execution = await executeTransfer(cwd, options);
+  process.stdout.write(options.json ? `${JSON.stringify(execution.payload, null, 2)}\n` : execution.rendered);
+  if (execution.exitStatus !== 0) {
+    process.exitCode = execution.exitStatus;
+  }
+}
+
 async function main() {
   const [subcommand, ...argv] = process.argv.slice(2);
 
@@ -660,6 +742,9 @@ async function main() {
       break;
     case "cancel":
       await handleCancel(argv);
+      break;
+    case "transfer":
+      await handleTransfer(argv);
       break;
     default:
       throw new Error(`Unknown subcommand: ${subcommand ?? "(none)"}`);
