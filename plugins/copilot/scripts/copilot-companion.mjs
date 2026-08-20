@@ -295,13 +295,7 @@ async function handleTask(argv) {
   }
 }
 
-async function handleTaskResumeCandidate(argv) {
-  const { options } = parseCommandInput(argv, {
-    valueOptions: ["cwd"],
-    booleanOptions: ["json"]
-  });
-
-  const cwd = options.cwd ? path.resolve(process.cwd(), options.cwd) : process.cwd();
+export async function findTaskResumeCandidate(cwd, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
 
   let candidate = null;
@@ -311,7 +305,17 @@ async function handleTaskResumeCandidate(argv) {
     candidate = null;
   }
 
-  const report = { available: Boolean(candidate), sessionId: candidate?.sessionId ?? null };
+  return { available: Boolean(candidate), sessionId: candidate?.sessionId ?? null };
+}
+
+async function handleTaskResumeCandidate(argv) {
+  const { options } = parseCommandInput(argv, {
+    valueOptions: ["cwd"],
+    booleanOptions: ["json"]
+  });
+
+  const cwd = options.cwd ? path.resolve(process.cwd(), options.cwd) : process.cwd();
+  const report = await findTaskResumeCandidate(cwd, options);
   process.stdout.write(
     options.json
       ? `${JSON.stringify(report, null, 2)}\n`

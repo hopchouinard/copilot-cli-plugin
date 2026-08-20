@@ -78,7 +78,19 @@ const handlers = {
   "session.metadata.snapshot": (params) => ({ sessionId: params.sessionId, currentMode: "plan" }),
   "sessions.list": () => ({ sessions: scenario.sessions ?? [] }),
   "session.interruptMainTurn": () => ({ ok: true }),
-  "session.destroy": () => ({ success: true }),
+  "session.destroy": (params) => {
+    // The real Copilot CLI only emits session.shutdown when the session is
+    // actually torn down via session.destroy — never inline in a turn's
+    // event stream. runCopilotTurn does not call session.destroy today, so
+    // in practice this never fires during a normal task/review run; usage
+    // observed during a turn comes from assistant.usage events instead.
+    emitEvent(params.sessionId, {
+      id: `evt-${Math.random().toString(36).slice(2)}`,
+      type: "session.shutdown",
+      data: scenario.shutdown ?? { shutdownType: "routine", totalPremiumRequests: 1 }
+    });
+    return { success: true };
+  },
   "session.send": (params) => {
     queueMicrotask(() => replayEvents(params.sessionId));
     return { messageId: "msg-1" };
@@ -90,8 +102,8 @@ function replayEvents(sessionId) {
     { type: "session.start", data: { sessionId } },
     { type: "assistant.turn_start", data: {} },
     { type: "assistant.message", data: { content: scenario.finalMessage ?? "fixture answer" } },
-    { type: "assistant.turn_end", data: { status: "completed" } },
-    { type: "session.shutdown", data: { shutdownType: "routine", totalPremiumRequests: 1 } }
+    { type: "assistant.usage", data: { premiumRequests: scenario.premiumRequests ?? 1 } },
+    { type: "assistant.turn_end", data: { status: "completed" } }
   ];
   for (const event of events) {
     emitEvent(sessionId, { id: `evt-${Math.random().toString(36).slice(2)}`, ...event });

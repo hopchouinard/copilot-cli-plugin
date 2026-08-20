@@ -135,6 +135,30 @@ test("read-only turns on the resume path also transmit tool exclusions and permi
   );
 });
 
+test(
+  "a duplicate assistant.turn_end resolves the run instead of hanging",
+  { timeout: 5000 },
+  async () => {
+    // capture.completed guards against a second resolve(); this is a
+    // regression test for that guard. A duplicate turn_end must not
+    // leave the run's promise permanently pending.
+    const result = await runCopilotTurn(process.cwd(), {
+      prompt: "go",
+      model: "claude-haiku-4.5",
+      readOnly: true,
+      ...withScenario({
+        events: [
+          { type: "assistant.turn_start", data: {} },
+          { type: "assistant.message", data: { content: "done" } },
+          { type: "assistant.turn_end", data: { status: "completed" } },
+          { type: "assistant.turn_end", data: { status: "completed" } }
+        ]
+      })
+    });
+    assert.equal(result.finalMessage, "done");
+  }
+);
+
 test("parseStructuredOutput strips a fenced code block before parsing", () => {
   const parsed = parseStructuredOutput('```json\n{"verdict":"approve"}\n```');
   assert.equal(parsed.parseError, null);
