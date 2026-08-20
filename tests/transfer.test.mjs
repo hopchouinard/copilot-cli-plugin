@@ -357,7 +357,14 @@ test("redactCredentials never emits <redacted> directly adjacent to the real sec
     { command: "CREDENTIAL=supersecretvalue --flag", secret: "supersecretvalue" },
     { command: 'curl -H "Authorization: Bearer sk-live-abc123XYZ"', secret: "sk-live-abc123XYZ" },
     { command: "echo Bearer sk-live-abc123XYZ", secret: "sk-live-abc123XYZ" },
-    { command: "API_KEY=xyz789 --deploy", secret: "xyz789" }
+    { command: "API_KEY=xyz789 --deploy", secret: "xyz789" },
+    { command: "AWS_SECRET_ACCESS_KEY=realsecret9 --region us-east-1", secret: "realsecret9" },
+    // Unterminated quotes — the exact shape that produced the misleading
+    // "<redacted>" beside a live secret before this round's fix. The
+    // "secret" here is everything after the opening quote, since a quote
+    // that never closes must be redacted through the end of the string.
+    { command: 'TOKEN="abcsecretvalue', secret: "abcsecretvalue" },
+    { command: 'MY_TOKEN="ghp_unterminated', secret: "ghp_unterminated" }
   ];
 
   const escapeRegExp = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -372,6 +379,42 @@ test("redactCredentials never emits <redacted> directly adjacent to the real sec
       `"<redacted>" sat directly next to the real secret in: ${redacted}`
     );
   }
+});
+
+test("redactCredentials does not over-redact identifiers that merely start with a keyword", () => {
+  // Regression guard: making the keyword's prefix optional (to catch bare
+  // TOKEN=/KEY=/etc) without also bounding the keyword's END meant anything
+  // *starting with* a keyword matched too, since nothing stopped the
+  // trailing [A-Za-z0-9_]* from swallowing the rest of a longer word. A
+  // destroyed file path in the digest is a different kind of wrong than a
+  // leaked secret, but it is still wrong — these must survive
+  // byte-identical.
+  const untouched = [
+    "KEYBOARD=us",
+    "--keyfile=/etc/ssl/x.pem",
+    "TOKENIZER=bpe run.sh",
+    "SECRETARY=jane schedule.sh",
+    "MONKEY=1"
+  ];
+  for (const command of untouched) {
+    assert.equal(redactCredentials(command), command);
+  }
+});
+
+test("redactCredentials redacts an unterminated quoted value through the end of the string, not with a zero-width marker", () => {
+  // Regression guard for the exact defect this round's fix was filed to
+  // eliminate: when a quoted value never closes, the quoted branch used to
+  // fail outright, the unquoted fallback couldn't cross the quote
+  // character either, and the whole match collapsed to zero width right
+  // after "=" — splicing "<redacted>" in beside the still-intact secret
+  // (`TOKEN=<redacted>"abcsecretvalue`). The opening quote must consume
+  // everything after it, leaving nothing of the secret behind.
+  assert.equal(redactCredentials('TOKEN="abcsecretvalue'), 'TOKEN="<redacted>');
+  assert.equal(redactCredentials('MY_TOKEN="ghp_unterminated'), 'MY_TOKEN="<redacted>');
+});
+
+test("redactCredentials leaves a genuinely empty assignment untouched rather than inserting a marker beside nothing", () => {
+  assert.equal(redactCredentials("TOKEN="), "TOKEN=");
 });
 
 test("the digest redacts credential-shaped commands before they reach the markdown", () => {

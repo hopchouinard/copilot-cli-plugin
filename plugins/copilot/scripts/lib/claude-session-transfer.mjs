@@ -132,23 +132,57 @@ export function redactCredentials(command) {
   // NAME=value / NAME="value" assignments where NAME looks secret-ish —
   // keeps the assignment shape (name, quoting) but drops the value.
   //
-  // The name's prefix is OPTIONAL: TOKEN, KEY, SECRET, PASSWORD, and
+  // The name's prefix is OPTIONAL but must end at an underscore boundary,
+  // and the keyword itself is bounded by a negative lookahead forbidding a
+  // trailing identifier character. TOKEN, KEY, SECRET, PASSWORD, and
   // CREDENTIAL are exactly the bare names the requirement calls out, and
   // they are everyday shell/CI idioms on their own (`TOKEN=$X`,
   // `KEY=... deploy.sh`) — a mandatory prefix character would make the
-  // named case simply not match.
+  // named case simply not match. But an UNBOUNDED keyword over-redacts:
+  // without the lookahead, "KEYBOARD", "--keyfile", "TOKENIZER", and
+  // "SECRETARY" all matched too (a *different* kind of wrong — mangling an
+  // unrelated file path or word in the digest, not a leak, but still
+  // wrong). The lookahead requires the keyword to end the identifier (or
+  // to be followed by another underscore-delimited segment), so
+  // "AWS_SECRET_ACCESS_KEY" still matches in full while "KEYBOARD" does not
+  // match at all.
   //
-  // The value is captured as ONE alternation with two fully-bounded
-  // branches — quoted (spanning spaces via a not-the-closing-quote loop) or
-  // unquoted (up to the next space/quote) — rather than an optional-quote
-  // character class. That avoids the failure mode where a quoted value
-  // containing a space can't be spanned, the quote match backtracks to
-  // zero width, and the marker gets inserted right before the untouched
-  // secret: never emit `<redacted>` immediately followed by text from the
-  // same assignment.
+  // The value is one alternation with three fully-bounded branches, each
+  // chosen so the match can never stop short of the real value boundary
+  // and leave a marker sitting beside untouched secret text:
+  //   1. Quoted and terminated — spans spaces via a not-the-closing-quote
+  //      loop, up to the real closing quote.
+  //   2. Quoted but NEVER terminated (e.g. `TOKEN="abc` with no closing
+  //      quote before the string ends) — redacts from the opening quote
+  //      through the end of the string. Without this branch, branch 1
+  //      fails outright (no closing quote to find), the pattern falls
+  //      through to the unquoted branch, and THAT branch's [^\s"']* can't
+  //      cross the quote character it just saw either — so it matches
+  //      zero-width right after "=" and the marker gets spliced in next to
+  //      the live secret. This branch exists specifically so that can't
+  //      happen: a value that opens with a quote is never left partially
+  //      unconsumed.
+  //   3. Unquoted — up to the next space/quote, or empty if none.
+  // If the matched value is a quote-less empty string (branch 3, nothing
+  // to redact at all — e.g. `TOKEN=` with nothing following), the original
+  // text is returned untouched rather than inserting a marker beside
+  // nothing: leaving it alone is honest, and only branches 1/2 (where a
+  // quote was actually opened) ever warrant a marker.
   redacted = redacted.replace(
-    /\b((?:[A-Za-z_][A-Za-z0-9_]*)?(?:TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL)[A-Za-z0-9_]*)(\s*=\s*)(?:(["'])((?:(?!\3).)*)\3|[^\s"']*)/gi,
-    (_match, name, eq, quote) => (quote ? `${name}${eq}${quote}<redacted>${quote}` : `${name}${eq}<redacted>`)
+    /\b((?:[A-Za-z0-9_]*_)?(?:TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL)(?![A-Za-z0-9]))(\s*=\s*)(?:(["'])(?:((?:(?!\3)[\s\S])*)\3|([\s\S]*))|([^\s"']*))/gi,
+    (match, name, eq, quote, terminatedValue, _unterminatedValue, unquotedValue) => {
+      if (quote !== undefined) {
+        // terminatedValue is defined (even as "") only when branch 1 (a
+        // real closing quote) matched; branch 2's unterminatedValue never
+        // gets a closing quote to echo back, since none existed.
+        const closingQuote = terminatedValue !== undefined ? quote : "";
+        return `${name}${eq}${quote}<redacted>${closingQuote}`;
+      }
+      if (!unquotedValue) {
+        return match;
+      }
+      return `${name}${eq}<redacted>`;
+    }
   );
 
   return redacted;
