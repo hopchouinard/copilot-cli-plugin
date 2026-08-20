@@ -112,6 +112,16 @@ const handlers = {
   "session.mode.set": () => null,
   "session.name.set": () => null,
   "session.permissions.setAllowAll": () => ({ ok: true }),
+  // Fake for the real permission-decision RPC (confirmed live against
+  // Copilot 1.0.80): records the call so a test can assert on exactly which
+  // decision the client sent, and returns the real result shape
+  // (`{ success: boolean }`) — false for an unknown/already-resolved
+  // requestId, matching what a live probe against the real CLI observed.
+  "session.permissions.handlePendingPermissionRequest": (params) => {
+    recordCall("session.permissions.handlePendingPermissionRequest", params);
+    const known = scenario.permissionEvent?.requestId === params.requestId;
+    return { success: Boolean(known) };
+  },
   "session.metadata.snapshot": (params) => ({ sessionId: params.sessionId, currentMode: "plan" }),
   "sessions.list": () => ({ sessions: scenario.sessions ?? [] }),
   "session.interruptMainTurn": () => ({ ok: true }),
@@ -137,6 +147,21 @@ const handlers = {
           scenario.serverRequest.params ?? {}
         );
         recordCall("__serverRequestReply", reply);
+      }
+      // Simulates the real permission mechanism confirmed live against
+      // Copilot 1.0.80: a `permission.requested` session.event, not a
+      // server→client request. This is what a self-collect review (>2
+      // files, git.mjs's DEFAULT_INLINE_DIFF_MAX_FILES) hung on forever
+      // before the client learned to answer it.
+      if (scenario.permissionEvent) {
+        emitEvent(params.sessionId, {
+          id: `evt-${Math.random().toString(36).slice(2)}`,
+          type: "permission.requested",
+          data: {
+            requestId: scenario.permissionEvent.requestId,
+            permissionRequest: scenario.permissionEvent.permissionRequest
+          }
+        });
       }
       replayEvents(params.sessionId);
     });

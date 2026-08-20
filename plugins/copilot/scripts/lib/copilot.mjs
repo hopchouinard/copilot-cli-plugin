@@ -8,7 +8,25 @@ export const TASK_SESSION_PREFIX = "Copilot Companion Task";
 export const DEFAULT_CONTINUE_PROMPT =
   "Continue from the current session state. Pick the next highest-value step and follow through until the task is resolved.";
 
-const READ_ONLY_EXCLUDED_TOOLS = ["write", "edit", "str_replace_editor", "create_file", "apply_patch"];
+// Real tool names, discovered by a live, no-prompt probe against Copilot
+// CLI 1.0.80 (session.tools.initializeAndValidate followed by
+// session.tools.getCurrentMetadata on a freshly created session). The full
+// baseline tool set that probe returned was: bash, read_bash, stop_bash,
+// list_bash, view, create, edit, web_fetch, skill, sql, read_agent,
+// list_agents, write_agent, grep, glob, task. Of those, only `create`
+// (writes new files) and `edit` (string-replaces inside existing files)
+// mutate the working tree, so those two are the entire real exclusion list.
+// The previous list — "write", "str_replace_editor", "create_file",
+// "apply_patch" — was fiction: the same probe's session.info events named
+// each of them individually as "Unknown tool name in the tool
+// excludedlist", meaning read-only fencing layer 1 (excludedTools) was
+// silently inert for everything except "edit". `bash` is deliberately kept
+// OFF this list: git.mjs's self-collect path (>DEFAULT_INLINE_DIFF_MAX_FILES
+// files) requires Copilot to inspect the diff itself with git commands, and
+// the permission allowlist below (layer 3) is what actually gates which
+// commands are allowed to run — excluding bash entirely would break
+// self-collect reviews outright rather than sandbox them.
+const READ_ONLY_EXCLUDED_TOOLS = ["create", "edit"];
 const INFERRED_COMPLETION_MS = 250;
 const NOT_INSTALLED =
   "GitHub Copilot CLI is not installed or is too old. Install it with `npm install -g @github/copilot`, then rerun `/copilot:setup`.";
@@ -20,6 +38,15 @@ const NOT_INSTALLED =
 // it provokes), so this matches broadly on the vocabulary GitHub's other
 // dotted RPC names use for this concept ("permission", "confirm", "approve")
 // rather than a single hardcoded string.
+//
+// CONFIRMED VESTIGIAL as of an instrumented live run against Copilot CLI
+// 1.0.80: the real permission-request mechanism is not a server→client
+// request at all. It's a `session.event` notification of type
+// `permission.requested` (see handlePermissionRequestedEvent below), and the
+// probe counted zero server→client requests across an entire self-collect
+// review turn. This matching/handling is kept only as defensive behaviour —
+// "never leave a server request unanswered" is still correct even though
+// this specific path is not what production traffic actually uses.
 const PERMISSION_REQUEST_METHOD_PATTERN = /permission|confirm|approv/i;
 
 // Spec §6.3 layer 3 calls for "denying anything not on an explicit read
@@ -128,6 +155,88 @@ function createServerRequestHandler({ readOnly, onProgress }) {
 
     return buildPermissionResponse(readOnly, params);
   };
+}
+
+// The actual permission mechanism, confirmed by an instrumented live run
+// against Copilot CLI 1.0.80: the server signals a pending tool-permission
+// decision via a `session.event` notification —
+//   { type: "permission.requested",
+//     data: { requestId, permissionRequest: { kind: "shell", fullCommandText, intention, ... } } }
+// — and expects the client to resolve it by calling
+// `session.permissions.handlePendingPermissionRequest`. That probe counted
+// zero server→client JSON-RPC requests across the whole turn, so
+// createServerRequestHandler/PERMISSION_REQUEST_METHOD_PATTERN above never
+// actually fire for permissions in production; this is the real path.
+//
+// Spec §6.3 layer 3's "deny-by-default... denying anything not on an
+// explicit read allowlist" now has much better input to work with than the
+// params-shape guessing above: `permissionRequest.kind` is the literal
+// string "shell" and `fullCommandText` is the literal command, so the
+// allowlist matches directly against it instead of probing candidate field
+// paths. Non-shell permission kinds (write, mcp, url, memory, ...) have no
+// allowlist and are denied outright under a read-only posture.
+//
+// A write-capable turn already calls session.permissions.setAllowAll before
+// sending the prompt, and the confirmed live run showed a write-capable
+// rescue completing in 5.7s with none of this event handling in place —
+// i.e. setAllowAll suppresses the need for a per-request decision entirely.
+// So a write-capable turn approves unconditionally here rather than
+// re-deriving a decision setAllowAll has already made moot.
+function decidePermission(readOnly, permissionRequest) {
+  if (!readOnly) {
+    return { kind: "approve-once" };
+  }
+  if (permissionRequest?.kind === "shell" && isAllowedReadOnlyCommand(permissionRequest.fullCommandText)) {
+    return { kind: "approve-once" };
+  }
+  return {
+    kind: "reject",
+    feedback: "Denied by read-only review policy: command is not on the read-only inspection allowlist."
+  };
+}
+
+// Answers one `permission.requested` session event. The `{ sessionId,
+// requestId, result }` params shape and the `{ kind: "approve-once" }` /
+// `{ kind: "reject", feedback }` result variants were confirmed by a live,
+// no-prompt probe against Copilot CLI 1.0.80 (creating a session and
+// calling handlePendingPermissionRequest with a bogus requestId): omitting
+// `sessionId` fails with "Missing sessionId in
+// session.permissions.handlePendingPermissionRequest request"; including it
+// succeeds structurally (`{ success: false }`, since the bogus id matches no
+// pending request). Both result `kind` variants were accepted without error.
+//
+// Never throws: a permission decision that fails to send must not take down
+// the whole turn (which would otherwise convert a request the server IS
+// still waiting on into an unhandled rejection instead of just a stuck,
+// diagnosable turn) — it's reported via onProgress instead.
+async function handlePermissionRequestedEvent(client, sessionId, event, { readOnly, onProgress }) {
+  const requestId = event?.data?.requestId;
+  if (!requestId) {
+    return;
+  }
+  const permissionRequest = event.data.permissionRequest;
+  const decision = decidePermission(readOnly, permissionRequest);
+  const label =
+    permissionRequest?.kind === "shell"
+      ? shorten(permissionRequest.fullCommandText)
+      : String(permissionRequest?.kind ?? "unknown");
+  emit(onProgress, `Permission request (${label}): ${decision.kind}`, "investigating", {
+    logTitle: "Permission request",
+    logBody: JSON.stringify({ requestId, permissionRequest, decision }, null, 2)
+  });
+  try {
+    await client.request("session.permissions.handlePendingPermissionRequest", {
+      sessionId,
+      requestId,
+      result: decision
+    });
+  } catch (error) {
+    emit(
+      onProgress,
+      `Failed to answer permission request ${requestId}: ${error instanceof Error ? error.message : String(error)}`,
+      "failed"
+    );
+  }
 }
 
 function shorten(text, limit = 96) {
@@ -342,6 +451,35 @@ function applyEvent(capture, event) {
       }
       break;
     case "assistant.turn_end":
+      // One inference round within a potentially multi-round agentic turn
+      // has ended — NOT necessarily the whole turn. Discovered live against
+      // Copilot 1.0.80 while verifying the permission-event fix (Fix 1):
+      // a self-collect review (git.mjs's self-collect path, >2 files) has
+      // Copilot call a tool (e.g. `git diff`) in round 1, and
+      // assistant.turn_end fires for THAT round the instant the tool call
+      // resolves — before the model has written any actual review content.
+      // Resolving the capture here unconditionally (the pre-existing
+      // behaviour) silently truncated exactly that kind of turn to an empty
+      // result once Fix 1 stopped it from hanging on the unanswered
+      // permission request instead. `session.idle` (below) is the
+      // authoritative "nothing more is coming" signal, so this case is now
+      // progress-logging only. It deliberately leaves any inferred-
+      // completion timer alone (does not clear it): a tool-only round never
+      // carries an assistant.message (confirmed by the same live run —
+      // round 1 of a self-collect review had zero assistant.message events,
+      // only tool calls), so in practice a message only ever appears in the
+      // turn's final round, and scheduleInferredCompletion (unchanged) is
+      // what lets that message's 250ms fallback timer still resolve the
+      // single-round happy path — and any build that never emits
+      // session.idle at all — exactly as it did before this fix.
+      emit(capture.onProgress, "Turn round completed.", "investigating");
+      break;
+    case "session.idle":
+      // The authoritative "the whole agentic turn is done" signal — see the
+      // assistant.turn_end comment above. The real Copilot CLI defers this
+      // until all of the turn's work (including multi-round tool use) has
+      // actually finished, unlike assistant.turn_end which fires once per
+      // inference round.
       clearTimeout(capture.timer);
       if (!capture.completed) {
         capture.completed = true;
@@ -360,6 +498,21 @@ function applyEvent(capture, event) {
     case "error":
       capture.error = data;
       emit(capture.onProgress, `Copilot error: ${data.message ?? "unknown"}`, "failed");
+      break;
+    case "session.info":
+      // Fix 2 (permission-fix wave): configuration-category session.info
+      // events are exactly what surfaced the fictional excludedTools names
+      // during the live 1.0.80 acceptance run ("Unknown tool name in the
+      // tool excludedlist: ..."). Had these been logged, that would have
+      // been caught on the first live run instead of the twentieth —
+      // surface them into the progress log so the same class of runtime
+      // mismatch is visible immediately in future.
+      if (data.infoType === "configuration" && data.message) {
+        emit(capture.onProgress, `Configuration: ${data.message}`, null, {
+          logTitle: "Session configuration",
+          logBody: data.message
+        });
+      }
       break;
     default:
       break;
@@ -391,22 +544,54 @@ export async function runCopilotTurn(cwd, options = {}) {
       capture.resolve = resolve;
     });
 
+    // Tracks in-flight handlePermissionRequestedEvent calls so the turn can
+    // wait for all of them to actually finish (see below, after
+    // capture.promise resolves) before returning — otherwise a permission
+    // reply could still be in flight on the wire when withClient's `finally`
+    // closes the RPC client, dropping the reply and, on a real server that's
+    // still genuinely waiting on it, reintroducing exactly the class of hang
+    // this fix removes.
+    const pendingPermissionReplies = [];
+
     client.setNotificationHandler((message) => {
       if (message.method !== "session.event" || message.params?.sessionId !== sessionId) {
         return;
       }
+      const event = message.params.event;
+
+      // Fix 1 (permission-fix wave): this is the confirmed real permission
+      // mechanism — see handlePermissionRequestedEvent's comment. It is
+      // dispatched here, ahead of the capture.started buffering gate below,
+      // because the server's turn is blocked on this specific reply right
+      // now; deferring it behind capture bookkeeping (which exists to order
+      // progress reporting, not to gate correctness) would reintroduce the
+      // exact hang this fix removes. handlePermissionRequestedEvent never
+      // throws (failures are reported via onProgress instead), so this can't
+      // produce an unhandled rejection; it's tracked in
+      // pendingPermissionReplies purely so the turn can wait for it later.
+      if (event?.type === "permission.requested") {
+        pendingPermissionReplies.push(
+          handlePermissionRequestedEvent(client, sessionId, event, {
+            readOnly: Boolean(options.readOnly),
+            onProgress: options.onProgress
+          })
+        );
+      }
+
       if (!capture.started) {
-        capture.buffered.push(message.params.event);
+        capture.buffered.push(event);
         return;
       }
-      applyEvent(capture, message.params.event);
+      applyEvent(capture, event);
     });
 
-    // Spec §6.3 layer 3: with `requestPermission: true` below, the server
-    // blocks each tool call on a reply to a server→client request. Without
-    // this handler that request goes unanswered and the turn deadlocks
-    // forever (see rpc-client.mjs's handleServerRequest for the transport
-    // half of this fix).
+    // Spec §6.3 layer 3, vestigial path: with `requestPermission: true`
+    // below, older/other builds may block a tool call on a server→client
+    // request instead of the session.event notification handled above. Keep
+    // answering it — "never leave a server request unanswered" is correct
+    // defensive behaviour even though the confirmed 1.0.80 permission path
+    // is the notification above, not this (see rpc-client.mjs's
+    // handleServerRequest for the transport half of this).
     client.setServerRequestHandler(createServerRequestHandler({ readOnly: Boolean(options.readOnly), onProgress: options.onProgress }));
 
     if (resuming) {
@@ -470,6 +655,12 @@ export async function runCopilotTurn(cwd, options = {}) {
     capture.buffered.length = 0;
 
     await capture.promise;
+
+    // Drain any permission replies still in flight (see
+    // pendingPermissionReplies above) before touching the client again —
+    // assistant.turn_end can arrive before the reply to a permission
+    // request the same turn raised has finished its round trip.
+    await Promise.all(pendingPermissionReplies);
 
     // Fix C (Task 16 follow-up): `assistant.usage` events and `session.shutdown`
     // (which only fires on session.destroy, which this function never calls)

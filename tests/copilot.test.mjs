@@ -139,12 +139,17 @@ test("read-only turns on the resume path also transmit tool exclusions and permi
 });
 
 test(
-  "a duplicate assistant.turn_end resolves the run instead of hanging",
+  "a duplicate assistant.turn_end does not hang the run",
   { timeout: 5000 },
   async () => {
-    // capture.completed guards against a second resolve(); this is a
-    // regression test for that guard. A duplicate turn_end must not
-    // leave the run's promise permanently pending.
+    // assistant.turn_end is progress-logging only (see the permission-fix
+    // wave's change to applyEvent — session.idle is now the authoritative
+    // completion signal, since a self-collect review's tool-only rounds
+    // each raise their own turn_end without being the turn's actual end).
+    // No idle event is emitted by this scenario, so completion here comes
+    // from the pre-existing, unchanged scheduleInferredCompletion fallback
+    // timer armed by assistant.message; a duplicate turn_end must not
+    // interfere with that or leave the run's promise permanently pending.
     const result = await runCopilotTurn(process.cwd(), {
       prompt: "go",
       model: "claude-haiku-4.5",
@@ -159,6 +164,68 @@ test(
       })
     });
     assert.equal(result.finalMessage, "done");
+  }
+);
+
+test(
+  "a duplicate session.idle resolves the run instead of hanging",
+  { timeout: 5000 },
+  async () => {
+    // capture.completed guards against a second resolve(); this is the
+    // regression test for that guard against the new authoritative
+    // completion signal (session.idle replaced assistant.turn_end — see
+    // above). A duplicate session.idle must not leave the run's promise
+    // permanently pending or throw from a second capture.resolve() call.
+    const result = await runCopilotTurn(process.cwd(), {
+      prompt: "go",
+      model: "claude-haiku-4.5",
+      readOnly: true,
+      ...withScenario({
+        events: [
+          { type: "assistant.turn_start", data: {} },
+          { type: "assistant.message", data: { content: "done" } },
+          { type: "assistant.turn_end", data: { status: "completed" } },
+          { type: "session.idle", data: {} },
+          { type: "session.idle", data: {} }
+        ]
+      })
+    });
+    assert.equal(result.finalMessage, "done");
+  }
+);
+
+// Regression coverage for the exact bug an instrumented live run against
+// Copilot CLI 1.0.80 found while verifying Fix 1 (the permission-event fix):
+// a self-collect review (git.mjs's self-collect path, >2 files) sent
+// Copilot through a tool-only first round (fetching the diff with `git
+// diff`, no assistant.message at all) whose assistant.turn_end used to be
+// treated as the whole turn's completion — truncating the result to an
+// empty message before the model ever got to a second round to actually
+// write the review. This asserts a second round's message, arriving after
+// a first, message-less round's turn_end, is what the turn actually
+// returns.
+test(
+  "a tool-only first round does not truncate a self-collect turn before its real answer arrives",
+  { timeout: 5000 },
+  async () => {
+    const result = await runCopilotTurn(process.cwd(), {
+      prompt: "review this",
+      model: "claude-haiku-4.5",
+      readOnly: true,
+      ...withScenario({
+        events: [
+          { type: "assistant.turn_start", data: {} },
+          { type: "command.execute", data: { command: "git diff" } },
+          { type: "command.completed", data: { command: "git diff", exitCode: 0 } },
+          { type: "assistant.turn_end", data: { status: "completed" } },
+          { type: "assistant.turn_start", data: {} },
+          { type: "assistant.message", data: { content: "Found an off-by-one at mod1.js:3." } },
+          { type: "assistant.turn_end", data: { status: "completed" } },
+          { type: "session.idle", data: {} }
+        ]
+      })
+    });
+    assert.equal(result.finalMessage, "Found an off-by-one at mod1.js:3.");
   }
 );
 
@@ -226,6 +293,206 @@ test(
     assert.ok(reply.params.error, "an unrecognised method must be refused explicitly rather than guessed at");
   }
 );
+
+// Regression coverage for the permission-fix wave: an instrumented live run
+// against Copilot CLI 1.0.80 found the real permission mechanism is a
+// `session.event` notification of type `permission.requested` (not a
+// server→client request — the earlier tests above cover that vestigial
+// path), and that self-collect reviews (>2 files, git.mjs's
+// DEFAULT_INLINE_DIFF_MAX_FILES) hung forever because nothing ever answered
+// it via `session.permissions.handlePendingPermissionRequest`. These assert
+// the turn completes (a hang fails on the timeout) and that the decision
+// sent matches the read-only allowlist / write-capable posture.
+test(
+  "a permission.requested event for an allowlisted read-only command is answered with approve-once",
+  { timeout: 5000 },
+  async () => {
+    const capture = withCaptureScenario({
+      permissionEvent: {
+        requestId: "perm-1",
+        permissionRequest: { kind: "shell", fullCommandText: "git diff --stat", intention: "inspect the diff" }
+      }
+    });
+    const result = await runCopilotTurn(process.cwd(), {
+      prompt: "review this",
+      model: "claude-haiku-4.5",
+      readOnly: true,
+      ...capture
+    });
+    assert.equal(result.status, 0, "the turn must complete rather than hang");
+
+    const reply = readCapturedCalls(capture.capturePath).find(
+      (call) => call.method === "session.permissions.handlePendingPermissionRequest"
+    );
+    assert.ok(reply, "expected the client to answer the permission.requested event");
+    assert.equal(reply.params.requestId, "perm-1");
+    assert.deepEqual(reply.params.result, { kind: "approve-once" });
+  }
+);
+
+test(
+  "a permission.requested event for a non-allowlisted command is answered with reject under read-only posture",
+  { timeout: 5000 },
+  async () => {
+    const capture = withCaptureScenario({
+      permissionEvent: {
+        requestId: "perm-2",
+        permissionRequest: { kind: "shell", fullCommandText: "rm -rf /tmp/whatever", intention: "delete things" }
+      }
+    });
+    const result = await runCopilotTurn(process.cwd(), {
+      prompt: "review this",
+      model: "claude-haiku-4.5",
+      readOnly: true,
+      ...capture
+    });
+    assert.equal(result.status, 0, "the turn must complete rather than hang even on a denial");
+
+    const reply = readCapturedCalls(capture.capturePath).find(
+      (call) => call.method === "session.permissions.handlePendingPermissionRequest"
+    );
+    assert.ok(reply);
+    assert.equal(reply.params.result.kind, "reject");
+  }
+);
+
+test(
+  "a permission.requested event with a chained/piped allowlisted-looking command is still denied under read-only posture",
+  { timeout: 5000 },
+  async () => {
+    const capture = withCaptureScenario({
+      permissionEvent: {
+        requestId: "perm-3",
+        permissionRequest: {
+          kind: "shell",
+          fullCommandText: "git status; rm -rf .",
+          intention: "get status then clean up"
+        }
+      }
+    });
+    const result = await runCopilotTurn(process.cwd(), {
+      prompt: "review this",
+      model: "claude-haiku-4.5",
+      readOnly: true,
+      ...capture
+    });
+    assert.equal(result.status, 0);
+
+    const reply = readCapturedCalls(capture.capturePath).find(
+      (call) => call.method === "session.permissions.handlePendingPermissionRequest"
+    );
+    assert.ok(reply);
+    assert.equal(reply.params.result.kind, "reject", "a chained command must not ride through on its allowlisted prefix");
+  }
+);
+
+test(
+  "a permission.requested event for a non-shell kind is denied under read-only posture",
+  { timeout: 5000 },
+  async () => {
+    const capture = withCaptureScenario({
+      permissionEvent: {
+        requestId: "perm-4",
+        permissionRequest: { kind: "write", fileName: "src/a.js", intention: "patch a bug", diff: "" }
+      }
+    });
+    const result = await runCopilotTurn(process.cwd(), {
+      prompt: "review this",
+      model: "claude-haiku-4.5",
+      readOnly: true,
+      ...capture
+    });
+    assert.equal(result.status, 0);
+
+    const reply = readCapturedCalls(capture.capturePath).find(
+      (call) => call.method === "session.permissions.handlePendingPermissionRequest"
+    );
+    assert.ok(reply);
+    assert.equal(reply.params.result.kind, "reject", "a non-shell permission kind has no allowlist and must be denied");
+  }
+);
+
+test(
+  "a permission.requested event during a write-capable turn is approved unconditionally",
+  { timeout: 5000 },
+  async () => {
+    const capture = withCaptureScenario({
+      permissionEvent: {
+        requestId: "perm-5",
+        permissionRequest: { kind: "shell", fullCommandText: "npm install left-pad", intention: "add a dependency" }
+      }
+    });
+    const result = await runCopilotTurn(process.cwd(), {
+      prompt: "fix it",
+      model: "claude-haiku-4.5",
+      readOnly: false,
+      ...capture
+    });
+    assert.equal(result.status, 0);
+
+    const reply = readCapturedCalls(capture.capturePath).find(
+      (call) => call.method === "session.permissions.handlePendingPermissionRequest"
+    );
+    assert.ok(reply);
+    assert.deepEqual(reply.params.result, { kind: "approve-once" });
+  }
+);
+
+test("read-only turns exclude only the real write tools (create, edit), not bash", async () => {
+  const capture = withCaptureScenario({});
+  await runCopilotTurn(process.cwd(), {
+    prompt: "go",
+    model: "claude-haiku-4.5",
+    readOnly: true,
+    ...capture
+  });
+
+  const created = readCapturedCalls(capture.capturePath).find((call) => call.method === "session.create");
+  assert.ok(created);
+  assert.deepEqual(created.params.excludedTools, ["create", "edit"]);
+  assert.ok(!created.params.excludedTools.includes("bash"), "self-collect reviews need bash and must not exclude it");
+});
+
+test("session.info events with infoType 'configuration' are surfaced into the progress log", async () => {
+  const messages = [];
+  await runCopilotTurn(process.cwd(), {
+    prompt: "go",
+    model: "claude-haiku-4.5",
+    readOnly: true,
+    onProgress: (event) => messages.push(event.message),
+    ...withScenario({
+      events: [
+        { type: "assistant.turn_start", data: {} },
+        { type: "session.info", data: { infoType: "configuration", message: 'Unknown tool name in the tool excludedlist: "write"' } },
+        { type: "assistant.message", data: { content: "done" } },
+        { type: "assistant.turn_end", data: { status: "completed" } }
+      ]
+    })
+  });
+  assert.ok(
+    messages.some((message) => message.includes('Unknown tool name in the tool excludedlist: "write"')),
+    "expected the configuration session.info message to reach progress reporting"
+  );
+});
+
+test("session.info events with a non-configuration infoType are not surfaced", async () => {
+  const messages = [];
+  await runCopilotTurn(process.cwd(), {
+    prompt: "go",
+    model: "claude-haiku-4.5",
+    readOnly: true,
+    onProgress: (event) => messages.push(event.message),
+    ...withScenario({
+      events: [
+        { type: "assistant.turn_start", data: {} },
+        { type: "session.info", data: { infoType: "timing", message: "some timing detail" } },
+        { type: "assistant.message", data: { content: "done" } },
+        { type: "assistant.turn_end", data: { status: "completed" } }
+      ]
+    })
+  });
+  assert.ok(!messages.some((message) => message.includes("some timing detail")));
+});
 
 // Regression coverage for the inert premium-accounting finding: the real
 // Copilot CLI never populated assistant.usage or session.shutdown, but does
