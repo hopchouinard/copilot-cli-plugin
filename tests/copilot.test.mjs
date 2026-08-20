@@ -115,7 +115,10 @@ test("read-only turns exclude write tools and set plan mode", async () => {
 });
 
 test("read-only turns on the resume path also transmit tool exclusions and permission requests", async () => {
-  const capture = withCaptureScenario({});
+  // session.resume now requires a session the fixture actually knows about
+  // (matching the real Copilot CLI, which rejects an unknown id) — plant it
+  // via `sessions`, the same field that seeds `sessions.list`.
+  const capture = withCaptureScenario({ sessions: [{ sessionId: "resumed-session-1" }] });
   const result = await runCopilotTurn(process.cwd(), {
     prompt: "continue",
     model: "claude-haiku-4.5",

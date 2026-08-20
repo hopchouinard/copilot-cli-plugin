@@ -14,7 +14,8 @@ function normalizeProgressEvent(value) {
     return {
       message: String(value.message ?? "").trim(),
       phase: typeof value.phase === "string" && value.phase.trim() ? value.phase.trim() : null,
-      threadId: typeof value.threadId === "string" && value.threadId.trim() ? value.threadId.trim() : null,
+      copilotSessionId:
+        typeof value.copilotSessionId === "string" && value.copilotSessionId.trim() ? value.copilotSessionId.trim() : null,
       turnId: typeof value.turnId === "string" && value.turnId.trim() ? value.turnId.trim() : null,
       stderrMessage: value.stderrMessage == null ? null : String(value.stderrMessage).trim(),
       logTitle: typeof value.logTitle === "string" && value.logTitle.trim() ? value.logTitle.trim() : null,
@@ -25,7 +26,7 @@ function normalizeProgressEvent(value) {
   return {
     message: String(value ?? "").trim(),
     phase: null,
-    threadId: null,
+    copilotSessionId: null,
     turnId: null,
     stderrMessage: String(value ?? "").trim(),
     logTitle: null,
@@ -69,7 +70,7 @@ export function createJobRecord(base, options = {}) {
 
 export function createJobProgressUpdater(workspaceRoot, jobId) {
   let lastPhase = null;
-  let lastThreadId = null;
+  let lastCopilotSessionId = null;
   let lastTurnId = null;
 
   return (event) => {
@@ -83,9 +84,9 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
       changed = true;
     }
 
-    if (normalized.threadId && normalized.threadId !== lastThreadId) {
-      lastThreadId = normalized.threadId;
-      patch.threadId = normalized.threadId;
+    if (normalized.copilotSessionId && normalized.copilotSessionId !== lastCopilotSessionId) {
+      lastCopilotSessionId = normalized.copilotSessionId;
+      patch.copilotSessionId = normalized.copilotSessionId;
       changed = true;
     }
 
@@ -123,7 +124,7 @@ export function createProgressReporter({ stderr = false, logFile = null, onEvent
     const event = normalizeProgressEvent(eventOrMessage);
     const stderrMessage = event.stderrMessage ?? event.message;
     if (stderr && stderrMessage) {
-      process.stderr.write(`[codex] ${stderrMessage}\n`);
+      process.stderr.write(`[copilot] ${stderrMessage}\n`);
     }
     appendLogLine(logFile, event.message);
     appendLogBlock(logFile, event.logTitle, event.logBody);
@@ -158,7 +159,7 @@ export async function runTrackedJob(job, runner, options = {}) {
     writeJobFile(job.workspaceRoot, job.id, {
       ...runningRecord,
       status: completionStatus,
-      threadId: execution.threadId ?? null,
+      copilotSessionId: execution.sessionId ?? null,
       turnId: execution.turnId ?? null,
       pid: null,
       phase: completionStatus === "completed" ? "done" : "failed",
@@ -170,7 +171,7 @@ export async function runTrackedJob(job, runner, options = {}) {
     upsertJob(job.workspaceRoot, {
       id: job.id,
       status: completionStatus,
-      threadId: execution.threadId ?? null,
+      copilotSessionId: execution.sessionId ?? null,
       turnId: execution.turnId ?? null,
       summary: execution.summary,
       phase: completionStatus === "completed" ? "done" : "failed",

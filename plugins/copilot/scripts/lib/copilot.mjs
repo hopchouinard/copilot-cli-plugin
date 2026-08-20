@@ -213,7 +213,13 @@ export async function runCopilotTurn(cwd, options = {}) {
   }
 
   return withClient(cwd, options, async (client) => {
-    const sessionId = options.sessionId ?? randomUUID();
+    // options.sessionId means "resume this EXISTING session" (session.resume).
+    // options.newSessionId means "create a NEW session using THIS id"
+    // (session.create) — used by background jobs, which mint a Copilot
+    // session id before their worker exists so /copilot:cancel can target
+    // it immediately. The real CLI rejects session.resume for an id it has
+    // never created, so these two must route to different RPC calls.
+    const sessionId = options.sessionId ?? options.newSessionId ?? randomUUID();
     const resuming = Boolean(options.sessionId);
 
     const capture = createCapture(sessionId, options.onProgress);

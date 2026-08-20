@@ -52,6 +52,22 @@ function recordCall(method, params) {
   }
 }
 
+// The real Copilot CLI rejects `session.resume` for an id it has never
+// created (probed live against Copilot 1.0.80: `-32603 "Session not found:
+// <id>"`). Track which ids this fixture process actually knows about so a
+// bug that calls session.resume for a session that was never created can't
+// hide behind a fixture that accepts any id. A scenario's `sessions` list
+// (already used to fake `sessions.list`) doubles as "sessions that already
+// existed before this run" and seeds this set too.
+const knownSessions = new Set((scenario.sessions ?? []).map((session) => session.sessionId));
+
+class RpcError extends Error {
+  constructor(code, message) {
+    super(message);
+    this.code = code;
+  }
+}
+
 const handlers = {
   connect: () => ({ ok: true, protocolVersion: 3, version: scenario.version ?? "1.0.80" }),
   ping: () => ({ message: "pong", timestamp: "2026-01-01T00:00:00.000Z", protocolVersion: 3 }),
@@ -66,10 +82,14 @@ const handlers = {
   "models.list": () => ({ models: scenario.models ?? DEFAULT_MODELS }),
   "session.create": (params) => {
     recordCall("session.create", params);
+    knownSessions.add(params.sessionId);
     return { sessionId: params.sessionId, workspacePath: `/tmp/fake/${params.sessionId}`, capabilities: {} };
   },
   "session.resume": (params) => {
     recordCall("session.resume", params);
+    if (!knownSessions.has(params.sessionId)) {
+      throw new RpcError(-32603, `Session not found: ${params.sessionId}`);
+    }
     return { sessionId: params.sessionId, workspacePath: `/tmp/fake/${params.sessionId}`, capabilities: {} };
   },
   "session.mode.set": () => null,
@@ -121,7 +141,15 @@ process.stdin.on("data", (chunk) => {
       send({ jsonrpc: "2.0", id: message.id, error: { code: -32601, message: `Unknown method: ${message.method}` } });
       continue;
     }
-    send({ jsonrpc: "2.0", id: message.id, result: handler(message.params ?? {}) });
+    try {
+      send({ jsonrpc: "2.0", id: message.id, result: handler(message.params ?? {}) });
+    } catch (error) {
+      send({
+        jsonrpc: "2.0",
+        id: message.id,
+        error: { code: error.code ?? -32603, message: error.message ?? String(error) }
+      });
+    }
   }
 });
 

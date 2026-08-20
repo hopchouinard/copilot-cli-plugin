@@ -37,6 +37,14 @@ import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
 const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 
+function firstMeaningfulLine(text, fallback) {
+  const line = String(text ?? "")
+    .split("\n")
+    .map((candidate) => candidate.trim())
+    .find(Boolean);
+  return line || fallback;
+}
+
 function normalizeArgv(argv) {
   if (argv.length === 1) {
     return argv[0]?.trim() ? splitRawArgumentString(argv[0]) : [];
@@ -243,35 +251,40 @@ export async function executeTask(cwd, options = {}) {
   });
   const effort = validateEffort(model, options.effort ?? config.effort, catalog);
 
-  // A background job pre-mints its Copilot sessionId at enqueue time (see
-  // handleTask's --background branch) so /copilot:cancel can interrupt it
-  // before the worker has reported a single progress event. That id is
-  // distinct from --resume-last, which looks up an *existing* session to
-  // continue; a preset id here is a brand-new session Copilot has never
-  // seen, just with a caller-chosen id.
-  let sessionId = options.sessionId ?? null;
-  let resumedExisting = false;
+  // A background job pre-mints its Copilot session id at enqueue time (see
+  // enqueueBackgroundTask) so /copilot:cancel can interrupt it before the
+  // worker has reported a single progress event. That id names a session
+  // Copilot has never seen — it must be *created* with that id
+  // (runCopilotTurn's newSessionId), not resumed. --resume-last, by
+  // contrast, looks up a session that genuinely already exists and must be
+  // resumed (runCopilotTurn's sessionId) — the real Copilot CLI rejects
+  // session.resume for an id it has never created. This is deliberately
+  // named copilotSessionId, not sessionId: job records reserve `sessionId`
+  // for the Claude Code session id (see createJobRecord/SESSION_ID_ENV),
+  // and conflating the two silently breaks per-session job filtering.
+  const presetSessionId = options.copilotSessionId ?? null;
+  let resumeSessionId = null;
   if (options.resumeLast) {
     const latest = await findLatestTaskSession(workspaceRoot, options);
     if (!latest) {
       throw new Error("No previous Copilot task session was found for this repository.");
     }
-    sessionId = latest.sessionId;
-    resumedExisting = true;
+    resumeSessionId = latest.sessionId;
   }
 
-  if (!options.prompt && !sessionId) {
+  if (!options.prompt && !resumeSessionId) {
     throw new Error("Provide a prompt, a prompt file, piped stdin, or use --resume-last.");
   }
 
   const result = await runCopilotTurn(workspaceRoot, {
-    sessionId,
+    sessionId: resumeSessionId,
+    newSessionId: presetSessionId,
     prompt: options.prompt,
-    defaultPrompt: resumedExisting ? DEFAULT_CONTINUE_PROMPT : "",
+    defaultPrompt: resumeSessionId ? DEFAULT_CONTINUE_PROMPT : "",
     model,
     effort,
     readOnly: !options.write,
-    sessionName: resumedExisting ? null : buildTaskSessionName(options.prompt),
+    sessionName: resumeSessionId ? null : buildTaskSessionName(options.prompt),
     onProgress: options.onProgress,
     binary: options.binary,
     env: options.env
@@ -290,6 +303,7 @@ export async function executeTask(cwd, options = {}) {
       usage: result.usage
     },
     rendered: renderTaskResult(result, { model, catalog, write: Boolean(options.write) }),
+    summary: firstMeaningfulLine(result.finalMessage, options.prompt || "Copilot Task finished."),
     usage: result.usage
   };
 }
@@ -308,25 +322,28 @@ function spawnDetachedTaskWorker(cwd, jobId) {
 }
 
 function enqueueBackgroundTask(cwd, workspaceRoot, options, prompt, resumeLast) {
-  // Mint the Copilot sessionId now, before the worker process exists, so a
+  // Mint the Copilot session id now, before the worker process exists, so a
   // stored-but-not-yet-running job still carries the id /copilot:cancel
-  // needs to interrupt it (spec §6.6 / §3.2).
-  const sessionId = randomUUID();
+  // needs to interrupt it (spec §6.6 / §3.2). This is stored as
+  // `copilotSessionId`, not `sessionId` — createJobRecord already uses
+  // `sessionId` for the Claude Code session id (from SESSION_ID_ENV), which
+  // filterJobsForCurrentSession and Task 13's SessionEnd reaping key off of.
+  // Conflating the two would make per-session job filtering silently match
+  // nothing.
+  const copilotSessionId = randomUUID();
   const write = Boolean(options.write);
 
-  const job = {
-    ...createJobRecord({
-      id: generateJobId("task"),
-      kind: "task",
-      kindLabel: "rescue",
-      title: "Copilot Task",
-      workspaceRoot,
-      jobClass: "task",
-      summary: prompt || (resumeLast ? "Resume previous task" : "Task"),
-      write
-    }),
-    sessionId
-  };
+  const job = createJobRecord({
+    id: generateJobId("task"),
+    kind: "task",
+    kindLabel: "rescue",
+    title: "Copilot Task",
+    workspaceRoot,
+    jobClass: "task",
+    summary: prompt || (resumeLast ? "Resume previous task" : "Task"),
+    write,
+    copilotSessionId
+  });
 
   const logFile = createJobLogFile(job.workspaceRoot, job.id, job.title);
   appendLogLine(logFile, "Queued for background execution.");
@@ -337,7 +354,7 @@ function enqueueBackgroundTask(cwd, workspaceRoot, options, prompt, resumeLast) 
     prompt,
     write,
     resumeLast,
-    sessionId
+    copilotSessionId
   };
 
   const child = spawnDetachedTaskWorker(cwd, job.id);
@@ -374,7 +391,7 @@ async function handleTask(argv) {
     const rendered = `${job.title} started in the background as ${job.id}. Check /copilot:status ${job.id} for progress.\n`;
     process.stdout.write(
       options.json
-        ? `${JSON.stringify({ jobId: job.id, status: "queued", sessionId: job.sessionId }, null, 2)}\n`
+        ? `${JSON.stringify({ jobId: job.id, status: "queued", copilotSessionId: job.copilotSessionId }, null, 2)}\n`
         : rendered
     );
     return;
@@ -418,19 +435,13 @@ async function handleTaskWorker(argv) {
     onEvent: createJobProgressUpdater(workspaceRoot, storedJob.id)
   });
 
+  // The worker must reuse the pre-minted copilotSessionId carried on the
+  // stored job/request rather than letting executeTask mint a second one,
+  // or a cancel issued before this line would target an id the worker
+  // never actually uses.
   await runTrackedJob(
     { ...storedJob, workspaceRoot, logFile },
-    async () => {
-      // The worker must reuse the pre-minted sessionId carried on the
-      // stored job/request rather than letting executeTask mint a second
-      // one, or a cancel issued before this line would target an id the
-      // worker never actually uses.
-      const execution = await executeTask(workspaceRoot, { ...request, onProgress });
-      // executeTask does not produce a `summary` (unlike the reference
-      // Codex runner); preserve the summary set at enqueue time instead of
-      // letting runTrackedJob's upsertJob patch blank it out with undefined.
-      return { ...execution, summary: storedJob.summary };
-    },
+    () => executeTask(workspaceRoot, { ...request, onProgress }),
     { logFile }
   );
 }
