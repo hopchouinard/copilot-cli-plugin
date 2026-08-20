@@ -29,6 +29,27 @@ function withScenario(scenario) {
   return { binary: FIXTURE, env: { ...process.env, FAKE_COPILOT_SCRIPT: file } };
 }
 
+// Like withScenario, but also points the fixture at a capture file so a test
+// can read back exactly which RPC calls (and params) the fixture received —
+// needed to assert on *which* bootstrap method was called (session.create
+// vs session.resume), not just on a return value that would look identical
+// either way.
+function withCaptureScenario(scenario) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "copilot-scn-"));
+  const scenarioPath = path.join(dir, "scenario.json");
+  fs.writeFileSync(scenarioPath, JSON.stringify(scenario), "utf8");
+  const capturePath = path.join(dir, "capture.json");
+  return {
+    binary: FIXTURE,
+    env: { ...process.env, FAKE_COPILOT_SCRIPT: scenarioPath, FAKE_COPILOT_CAPTURE_FILE: capturePath },
+    capturePath
+  };
+}
+
+function readCapturedCalls(capturePath) {
+  return fs.existsSync(capturePath) ? JSON.parse(fs.readFileSync(capturePath, "utf8")) : [];
+}
+
 test("a task run resolves the task model, not the review model", async () => {
   const cwd = tempWorkspace();
   setConfig(cwd, "reviewModel", "claude-sonnet-4.6");
@@ -83,6 +104,37 @@ test("--resume-last with no matching prior task session rejects with a clear err
   await assert.rejects(
     () => executeTask(cwd, { resumeLast: true, ...withScenario({ sessions: [] }) }),
     /No previous Copilot task session was found for this repository/
+  );
+});
+
+test("a background job's preset copilotSessionId creates a new session — it must never resume", async () => {
+  // Regression guard for the production defect the coordinator probed live
+  // against Copilot 1.0.80: session.resume for an id that was never created
+  // fails with -32603 "Session not found". A background job's pre-minted
+  // copilotSessionId must route to session.create, not session.resume, or
+  // every /copilot:task --background run fails immediately against the
+  // real CLI. Assert on the fixture's recorded RPC calls, not just on
+  // execution.sessionId — a resume would echo the same id back and look
+  // identical on the return value alone.
+  const cwd = tempWorkspace();
+  setConfig(cwd, "taskModel", "claude-haiku-4.5");
+  const capture = withCaptureScenario({});
+  const presetId = "11111111-2222-3333-4444-555555555555";
+
+  const execution = await executeTask(cwd, {
+    prompt: "run this in the background",
+    copilotSessionId: presetId,
+    ...capture
+  });
+  assert.equal(execution.sessionId, presetId);
+
+  const calls = readCapturedCalls(capture.capturePath);
+  const created = calls.find((call) => call.method === "session.create");
+  assert.ok(created, "expected a session.create call to be captured");
+  assert.equal(created.params.sessionId, presetId);
+  assert.ok(
+    !calls.some((call) => call.method === "session.resume"),
+    "session.resume must never be called for a preset copilotSessionId"
   );
 });
 
