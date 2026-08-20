@@ -48,7 +48,7 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/copilot-companion.mjs" cost-check --role tas
   - `Run in background` — describe it as "proceed at <label>"
   - `Switch to <cheapest>` — describe it as "rerun at <cheapestLabel>"
   - `Cancel`
-- If the user picks the cheaper model, append `--model <cheapest>` to the companion command.
+- If the user picks the cheaper model, add `--model <cheapest>` before routing to the subagent.
 - If the user cancels, do not launch anything and say so.
 - Foreground runs never ask. State the cost and run.
 
