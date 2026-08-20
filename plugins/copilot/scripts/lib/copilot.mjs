@@ -182,7 +182,8 @@ function applyEvent(capture, event) {
       if (!capture.completed) {
         capture.completed = true;
         emit(capture.onProgress, "Turn completed.", "finalizing");
-        capture.resolve();
+        capture.timer = setTimeout(() => capture.resolve(), INFERRED_COMPLETION_MS);
+        capture.timer.unref?.();
       }
       break;
     case "session.shutdown":

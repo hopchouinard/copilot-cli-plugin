@@ -104,4 +104,23 @@ export function renderReviewResult(parsed, options = {}) {
   return `${lines.join("\n")}\n`;
 }
 
+export function renderTaskResult(result, options = {}) {
+  const lines = [`# Copilot Task`, ""];
+  lines.push(`model  ${describeCost(options.model, options.catalog).label}`);
+  const usageLine = formatUsage(result.usage);
+  if (usageLine) {
+    lines.push(`usage  ${usageLine}`);
+  }
+  lines.push("");
+  lines.push(result.finalMessage || "(no output)");
+  if (options.write && result.touchedFiles.length > 0) {
+    lines.push("");
+    lines.push("Copilot edited these files:");
+    for (const file of result.touchedFiles) {
+      lines.push(`- ${file}`);
+    }
+  }
+  return `${lines.join("\n")}\n`;
+}
+
 export { formatUsage };

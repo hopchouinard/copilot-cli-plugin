@@ -11,14 +11,16 @@ import {
   fetchModelCatalog,
   runCopilotTurn,
   parseStructuredOutput,
-  buildTaskSessionName
+  buildTaskSessionName,
+  findLatestTaskSession,
+  DEFAULT_CONTINUE_PROMPT
 } from "./lib/copilot.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
 import { resolveModel, validateEffort, readUserSettings, readRepoSettings, isCatalogStale } from "./lib/models.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import { getConfig, setConfig } from "./lib/state.mjs";
 import { binaryAvailable } from "./lib/process.mjs";
-import { renderSetupReport, renderReviewResult } from "./lib/render.mjs";
+import { renderSetupReport, renderReviewResult, renderTaskResult } from "./lib/render.mjs";
 import { describeCost } from "./lib/usage.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
@@ -215,6 +217,108 @@ async function executeReview(cwd, options, { reviewLabel, template }) {
   };
 }
 
+export async function executeTask(cwd, options = {}) {
+  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  const config = getConfig(workspaceRoot);
+  const catalog = config.modelCatalog;
+
+  const { model } = resolveModel({
+    role: "task",
+    flagModel: options.model,
+    config,
+    env: process.env,
+    repoSettings: readRepoSettings(workspaceRoot),
+    userSettings: readUserSettings()
+  });
+  const effort = validateEffort(model, options.effort ?? config.effort, catalog);
+
+  let sessionId = null;
+  if (options.resumeLast) {
+    const latest = await findLatestTaskSession(workspaceRoot, options);
+    if (!latest) {
+      throw new Error("No previous Copilot task session was found for this repository.");
+    }
+    sessionId = latest.sessionId;
+  }
+
+  if (!options.prompt && !sessionId) {
+    throw new Error("Provide a prompt, a prompt file, piped stdin, or use --resume-last.");
+  }
+
+  const result = await runCopilotTurn(workspaceRoot, {
+    sessionId,
+    prompt: options.prompt,
+    defaultPrompt: sessionId ? DEFAULT_CONTINUE_PROMPT : "",
+    model,
+    effort,
+    readOnly: !options.write,
+    sessionName: sessionId ? null : buildTaskSessionName(options.prompt),
+    onProgress: options.onProgress,
+    binary: options.binary,
+    env: options.env
+  });
+
+  return {
+    exitStatus: result.status,
+    sessionId: result.sessionId,
+    payload: {
+      model,
+      effort,
+      mode: result.mode,
+      sessionId: result.sessionId,
+      rawOutput: result.finalMessage,
+      touchedFiles: result.touchedFiles,
+      usage: result.usage
+    },
+    rendered: renderTaskResult(result, { model, catalog, write: Boolean(options.write) }),
+    usage: result.usage
+  };
+}
+
+async function handleTask(argv) {
+  const { options, positionals } = parseCommandInput(argv, {
+    valueOptions: ["model", "effort", "cwd"],
+    booleanOptions: ["json", "write", "resume-last", "background", "wait"]
+  });
+
+  const cwd = options.cwd ? path.resolve(process.cwd(), options.cwd) : process.cwd();
+  const prompt = positionals.join(" ").trim();
+
+  const execution = await executeTask(cwd, {
+    ...options,
+    prompt,
+    resumeLast: Boolean(options["resume-last"])
+  });
+  process.stdout.write(options.json ? `${JSON.stringify(execution.payload, null, 2)}\n` : execution.rendered);
+  if (execution.exitStatus !== 0) {
+    process.exitCode = execution.exitStatus;
+  }
+}
+
+async function handleTaskResumeCandidate(argv) {
+  const { options } = parseCommandInput(argv, {
+    valueOptions: ["cwd"],
+    booleanOptions: ["json"]
+  });
+
+  const cwd = options.cwd ? path.resolve(process.cwd(), options.cwd) : process.cwd();
+  const workspaceRoot = resolveWorkspaceRoot(cwd);
+
+  let candidate = null;
+  try {
+    candidate = await findLatestTaskSession(workspaceRoot, options);
+  } catch {
+    candidate = null;
+  }
+
+  const report = { available: Boolean(candidate), sessionId: candidate?.sessionId ?? null };
+  process.stdout.write(
+    options.json
+      ? `${JSON.stringify(report, null, 2)}\n`
+      : `${report.available ? `A resumable task session is available: ${report.sessionId}` : "No resumable task session was found."}\n`
+  );
+}
+
 async function handleReview(argv, config) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["base", "scope", "model", "effort", "cwd"],
@@ -249,6 +353,12 @@ async function main() {
       break;
     case "adversarial-review":
       await handleReview(argv, { reviewLabel: "Adversarial Review", template: "adversarial-review", allowFocus: true });
+      break;
+    case "task":
+      await handleTask(argv);
+      break;
+    case "task-resume-candidate":
+      await handleTaskResumeCandidate(argv);
       break;
     default:
       throw new Error(`Unknown subcommand: ${subcommand ?? "(none)"}`);
