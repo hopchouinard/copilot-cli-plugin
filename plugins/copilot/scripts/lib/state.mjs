@@ -6,7 +6,28 @@ import path from "node:path";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
 const STATE_VERSION = 1;
-const PLUGIN_DATA_ENV = "CLAUDE_PLUGIN_DATA";
+// The harness sets CLAUDE_PLUGIN_DATA per plugin when it runs THAT plugin's
+// hook, so inside a hook it is always this plugin's directory. It is not safe
+// to read anywhere else. Commands run through Claude's Bash tool, whose
+// environment comes from the shared session env file that every installed
+// plugin's SessionStart hook appends to — and the reference plugin this one
+// was ported from exports CLAUDE_PLUGIN_DATA under that exact shared name.
+// With two such plugins installed the last SessionStart to run wins, and its
+// data directory becomes the value for every Bash call in the session,
+// including this plugin's commands.
+//
+// That split the plugin in half: hooks read the correct store while commands
+// wrote another plugin's. `/copilot:setup --enable-review-gate` set the flag
+// somewhere the Stop hook never looked, so the gate silently never armed.
+//
+// COPILOT_PLUGIN_DATA is this plugin's own name for the same value, exported
+// by its SessionStart hook, and cannot be clobbered by a neighbour. The
+// harness variable stays as a fallback because it IS correct inside a hook,
+// and because a command that runs before SessionStart has fired (a plugin
+// installed mid-session) has nothing better to use — that case is no worse
+// than the old behaviour and self-heals next session.
+const PLUGIN_DATA_ENV = "COPILOT_PLUGIN_DATA";
+const HARNESS_PLUGIN_DATA_ENV = "CLAUDE_PLUGIN_DATA";
 const FALLBACK_STATE_ROOT_DIR = path.join(os.tmpdir(), "copilot-companion");
 const STATE_FILE_NAME = "state.json";
 const JOBS_DIR_NAME = "jobs";
@@ -203,7 +224,7 @@ export function resolveStateDir(cwd) {
   const slugSource = path.basename(workspaceRoot) || "workspace";
   const slug = slugSource.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "workspace";
   const hash = createHash("sha256").update(canonicalWorkspaceRoot).digest("hex").slice(0, 16);
-  const pluginDataDir = process.env[PLUGIN_DATA_ENV];
+  const pluginDataDir = process.env[PLUGIN_DATA_ENV] || process.env[HARNESS_PLUGIN_DATA_ENV];
   const stateRoot = pluginDataDir ? path.join(pluginDataDir, "state") : FALLBACK_STATE_ROOT_DIR;
   return path.join(stateRoot, `${slug}-${hash}`);
 }

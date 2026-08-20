@@ -9,7 +9,12 @@ import { loadState, resolveStateFile, saveState } from "./lib/state.mjs";
 import { SESSION_ID_ENV } from "./lib/tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
-const PLUGIN_DATA_ENV = "CLAUDE_PLUGIN_DATA";
+// See the long comment in lib/state.mjs. Read the harness's per-plugin value,
+// publish it under a name only this plugin uses. Re-exporting it under the
+// shared CLAUDE_PLUGIN_DATA name — what this used to do — is precisely what
+// makes two plugins overwrite each other's store location.
+const PLUGIN_DATA_ENV = "COPILOT_PLUGIN_DATA";
+const HARNESS_PLUGIN_DATA_ENV = "CLAUDE_PLUGIN_DATA";
 
 function readHookInput() {
   const raw = fs.readFileSync(0, "utf8").trim();
@@ -75,7 +80,7 @@ function cleanupSessionJobs(cwd, sessionId) {
 function handleSessionStart(input) {
   appendEnvVar(SESSION_ID_ENV, input.session_id);
   appendEnvVar(TRANSCRIPT_PATH_ENV, input.transcript_path);
-  appendEnvVar(PLUGIN_DATA_ENV, process.env[PLUGIN_DATA_ENV]);
+  appendEnvVar(PLUGIN_DATA_ENV, process.env[HARNESS_PLUGIN_DATA_ENV]);
 }
 
 function handleSessionEnd(input) {
