@@ -1,3 +1,4 @@
+import { DEFAULT_MAX_STATUS_JOBS } from "./job-control.mjs";
 import { describeCost, formatUsage } from "./usage.mjs";
 
 function line(label, value) {
@@ -124,19 +125,25 @@ export function renderTaskResult(result, options = {}) {
 }
 
 export function renderStatusReport(report) {
+  const allJobs = report.jobs ?? [];
+  // --all shows every retained job; without it, cap the table to the same
+  // compact window buildStatusSnapshot uses for `recent`, so the flag
+  // actually changes what's rendered instead of being silently ignored.
+  const jobs = report.all ? allJobs : allJobs.slice(0, DEFAULT_MAX_STATUS_JOBS);
+
   const rows = [
     "| job | kind | status | phase | premium | summary |",
     "| --- | --- | --- | --- | --- | --- |"
   ];
 
-  for (const job of report.jobs ?? []) {
+  for (const job of jobs) {
     const premium = typeof job.usage?.premiumRequests === "number" ? String(job.usage.premiumRequests) : "-";
     rows.push(
       `| ${job.id} | ${job.kindLabel ?? job.kind ?? "-"} | ${job.status} | ${job.phase ?? "-"} | ${premium} | ${job.summary ?? "-"} |`
     );
   }
 
-  if ((report.jobs ?? []).length === 0) {
+  if (jobs.length === 0) {
     rows.push("| - | - | - | - | - | no jobs for this session |");
   }
 

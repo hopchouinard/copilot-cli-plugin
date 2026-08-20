@@ -551,8 +551,11 @@ async function handleStatus(argv) {
     return;
   }
 
-  const report = buildStatusSnapshot(cwd, { all: Boolean(options.all) });
-  process.stdout.write(options.json ? `${JSON.stringify(report, null, 2)}\n` : renderStatusReport(report));
+  const all = Boolean(options.all);
+  const report = buildStatusSnapshot(cwd, { all });
+  process.stdout.write(
+    options.json ? `${JSON.stringify(report, null, 2)}\n` : renderStatusReport({ ...report, all })
+  );
 }
 
 async function handleResult(argv) {
