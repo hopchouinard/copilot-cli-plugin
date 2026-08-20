@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+Model selection:
+- `/copilot:setup --model` now shows a numbered table of **every** model in the live catalog,
+  cheapest first, marking which models the review and task roles currently use. It replaces a
+  four-option `AskUserQuestion` picker that could only ever offer a third of a twelve-model roster,
+  leaving the rest reachable only by typing an id into "Other".
+- Any command taking `--model` also accepts a table row number, resolved by the script through the
+  same ordering the table was numbered with, so the number a user reads and the number they type
+  cannot point at different models. Model ids always win over row numbers.
+- `--review-model` and `--task-model` get the same treatment; previously only a bare `--model` was
+  handled and the other two threw `Missing value` at the user.
+- The cost guard in `/copilot:review`, `/copilot:adversarial-review`, and `/copilot:rescue` gains a
+  `Choose another model` option that opens the same table, instead of offering only the cheapest
+  model as an alternative.
+- New `copilot-companion.mjs models` subcommand backing all of the above, with `--json`. It
+  refreshes a stale roster before displaying it — a picker is where an out-of-date price does the
+  most damage.
+
 Fixes for every finding raised on PR #1 by the GitHub Copilot and Codex reviewers.
 
 Security:

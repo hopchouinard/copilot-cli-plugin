@@ -34,12 +34,15 @@ import {
   readRepoSettings,
   catalogHasModel,
   isCatalogStale,
+  orderedCatalogModels,
+  resolveModelSelection,
   cheapestModel
 } from "./lib/models.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
 import {
   renderSetupReport,
+  renderModelTable,
   renderReviewResult,
   renderTaskResult,
   renderStatusReport,
@@ -94,13 +97,17 @@ export async function buildSetupReport(cwd, options = {}) {
     if (!value) {
       continue;
     }
+    // Persist the resolved id, never the row number the user typed. A stored
+    // "7" would silently point at a different model the next time the roster
+    // changes, which is the whole failure mode the shared ordering avoids.
+    const resolved = resolveModelSelection(value, getConfig(workspaceRoot).modelCatalog).model;
     if (flag === "model") {
-      setConfig(workspaceRoot, "reviewModel", value);
-      setConfig(workspaceRoot, "taskModel", value);
-      actionsTaken.push(`Set both review and task models to ${value}.`);
+      setConfig(workspaceRoot, "reviewModel", resolved);
+      setConfig(workspaceRoot, "taskModel", resolved);
+      actionsTaken.push(`Set both review and task models to ${resolved}.`);
     } else {
-      setConfig(workspaceRoot, key, value);
-      actionsTaken.push(`Set ${key} to ${value}.`);
+      setConfig(workspaceRoot, key, resolved);
+      actionsTaken.push(`Set ${key} to ${resolved}.`);
     }
   }
 
@@ -153,7 +160,7 @@ export async function buildSetupReport(cwd, options = {}) {
     // could run, with the failure surfacing far from the setup call that
     // caused it. Both resolved models have to accept it.
     for (const role of ["review", "task"]) {
-      const probe = resolveModel({ role, config, env: process.env, repoSettings, userSettings });
+      const probe = resolveModel({ role, config, env: process.env, repoSettings, userSettings, catalog: modelCatalog });
       validateEffort(probe.model, options.effort, modelCatalog);
     }
     setConfig(workspaceRoot, "effort", options.effort);
@@ -162,8 +169,8 @@ export async function buildSetupReport(cwd, options = {}) {
   }
 
   const resolved = {
-    review: resolveModel({ role: "review", config, env: process.env, repoSettings, userSettings }),
-    task: resolveModel({ role: "task", config, env: process.env, repoSettings, userSettings }),
+    review: resolveModel({ role: "review", config, env: process.env, repoSettings, userSettings, catalog: modelCatalog }),
+    task: resolveModel({ role: "task", config, env: process.env, repoSettings, userSettings, catalog: modelCatalog }),
     effort: config.effort
   };
 
@@ -193,6 +200,60 @@ export async function buildSetupReport(cwd, options = {}) {
     actionsTaken,
     nextSteps
   };
+}
+
+// Backs the numbered model picker. Kept as its own subcommand rather than a
+// flag on `setup` because every command that needs a model choice — setup, and
+// the cost guard in review/adversarial-review/rescue — shows the same table,
+// and they must all show the SAME numbering.
+export async function buildModelListing(cwd, options = {}) {
+  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  const config = getConfig(workspaceRoot);
+  let catalog = config.modelCatalog;
+
+  // A picker is exactly where a stale roster does the most damage: the user
+  // chooses from what is displayed, so displaying an out-of-date list means
+  // choosing an out-of-date price. Refresh before showing it, and fall back to
+  // the cache when Copilot is unreachable rather than showing nothing.
+  if (options.refreshCatalog !== false && isCatalogStale(catalog)) {
+    try {
+      catalog = await fetchModelCatalog(cwd, options);
+      setConfig(workspaceRoot, "modelCatalog", catalog);
+    } catch {
+      catalog = config.modelCatalog;
+    }
+  }
+
+  const repoSettings = readRepoSettings(workspaceRoot);
+  const userSettings = readUserSettings();
+  const resolved = {
+    review: resolveModel({ role: "review", config, env: process.env, repoSettings, userSettings, catalog }).model,
+    task: resolveModel({ role: "task", config, env: process.env, repoSettings, userSettings, catalog }).model
+  };
+
+  return {
+    resolved,
+    // The same array, in the same order, that the rendered table numbers. A
+    // caller reading the JSON and a user reading the table are looking at one
+    // ordering, not two that happen to agree.
+    models: orderedCatalogModels(catalog).map((model, index) => ({ number: index + 1, ...model })),
+    catalogCachedAt: catalog?.cachedAt ?? null
+  };
+}
+
+async function handleModels(argv) {
+  const { options } = parseCommandInput(argv, {
+    valueOptions: ["cwd"],
+    booleanOptions: ["json"]
+  });
+
+  const cwd = options.cwd ? path.resolve(process.cwd(), options.cwd) : process.cwd();
+  const listing = await buildModelListing(cwd, options);
+  process.stdout.write(
+    options.json
+      ? `${JSON.stringify(listing, null, 2)}\n`
+      : renderModelTable({ models: listing.models }, listing.resolved)
+  );
 }
 
 async function handleSetup(argv) {
@@ -229,7 +290,8 @@ async function executeReview(cwd, options, { reviewLabel, template }) {
     config,
     env: process.env,
     repoSettings: readRepoSettings(workspaceRoot),
-    userSettings: readUserSettings()
+    userSettings: readUserSettings(),
+    catalog
   });
   const effort = validateEffort(model, options.effort ?? config.effort, catalog);
 
@@ -290,7 +352,8 @@ export async function executeTask(cwd, options = {}) {
     config,
     env: process.env,
     repoSettings: readRepoSettings(workspaceRoot),
-    userSettings: readUserSettings()
+    userSettings: readUserSettings(),
+    catalog
   });
   const effort = validateEffort(model, options.effort ?? config.effort, catalog);
 
@@ -576,7 +639,8 @@ export async function buildCostCheck(cwd, options = {}) {
     config,
     env: process.env,
     repoSettings: readRepoSettings(workspaceRoot),
-    userSettings: readUserSettings()
+    userSettings: readUserSettings(),
+    catalog
   });
 
   // This is the last checkpoint before a paid background run, and it was
@@ -764,7 +828,8 @@ export async function executeTransfer(cwd, options = {}) {
     config,
     env: process.env,
     repoSettings: readRepoSettings(workspaceRoot),
-    userSettings: readUserSettings()
+    userSettings: readUserSettings(),
+    catalog
   });
   const effort = validateEffort(model, options.effort ?? config.effort, catalog);
 
@@ -834,6 +899,9 @@ async function main() {
   const [subcommand, ...argv] = process.argv.slice(2);
 
   switch (subcommand) {
+    case "models":
+      await handleModels(argv);
+      break;
     case "setup":
       await handleSetup(argv);
       break;

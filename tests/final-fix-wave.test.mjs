@@ -331,17 +331,22 @@ test("also-fix (doc): review/adversarial-review/rescue tell Claude to forward --
   }
 });
 
-test("also-fix (doc): setup.md handles a bare --model itself instead of passing it to the script", () => {
+test("also-fix (doc): setup.md handles a bare model flag itself instead of passing it to the script", () => {
   const source = fs.readFileSync(path.join(REPO_ROOT, "plugins/copilot/commands/setup.md"), "utf8");
   assert.match(
     source,
-    /bare `--model` with no id after it/,
-    "setup.md must detect a valueless --model before invoking the script"
+    /bare model flag with no id after it/,
+    "setup.md must detect a valueless model flag before invoking the script"
   );
+  // All three flags take a value, so all three can arrive bare. Handling only
+  // --model left --review-model and --task-model throwing at the user.
+  for (const flag of ["--model", "--review-model", "--task-model"]) {
+    assert.match(source, new RegExp(`\`${flag}\``), `setup.md must name ${flag} as a bare-flag case`);
+  }
   assert.match(
     source,
-    /rejects a valueless `--model` outright/,
-    "setup.md must explain why the bare --model can't be passed through"
+    /rejects a valueless flag outright/,
+    "setup.md must explain why a bare model flag can't be passed through"
   );
 });
 
