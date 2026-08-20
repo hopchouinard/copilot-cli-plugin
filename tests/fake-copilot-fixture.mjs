@@ -85,6 +85,16 @@ class RpcError extends Error {
   }
 }
 
+let turnsSent = 0;
+
+function zeroMetrics(metrics) {
+  const zeroed = {};
+  for (const [key, value] of Object.entries(metrics)) {
+    zeroed[key] = typeof value === "number" ? 0 : value;
+  }
+  return zeroed;
+}
+
 const handlers = {
   connect: () => ({ ok: true, protocolVersion: 3, version: scenario.version ?? "1.0.80" }),
   ping: () => ({ message: "pong", timestamp: "2026-01-01T00:00:00.000Z", protocolVersion: 3 }),
@@ -123,7 +133,18 @@ const handlers = {
     return { success: Boolean(known) };
   },
   "session.metadata.snapshot": (params) => ({ sessionId: params.sessionId, currentMode: "plan" }),
-  "sessions.list": () => ({ sessions: scenario.sessions ?? [] }),
+  // The real CLI records the directory a session was created in and returns
+  // it as `context.cwd`. The fixture used to omit it entirely, which let a
+  // resume-scoping bug (any context-less session matching any repository)
+  // pass the suite — so default it to this fixture process's working
+  // directory, which IS the workspace the client spawned us in. A scenario
+  // can still set an explicit context to exercise the cross-repository case.
+  "sessions.list": () => ({
+    sessions: (scenario.sessions ?? []).map((session) => ({
+      context: { cwd: process.cwd() },
+      ...session
+    }))
+  }),
   "session.interruptMainTurn": () => ({ ok: true }),
   "session.destroy": (params) => {
     // The real Copilot CLI only emits session.shutdown when the session is
@@ -195,6 +216,7 @@ const handlers = {
 
       replayEvents(params.sessionId);
     });
+    turnsSent += 1;
     return { messageId: "msg-1" };
   },
   // Unimplemented unless a scenario opts in with `metrics`, matching every
@@ -209,6 +231,17 @@ const handlers = {
     if (!scenario.metrics || scenario.metricsUnsupported) {
       throw new RpcError(-32601, "Unknown method: session.usage.getMetrics");
     }
+    // These are CUMULATIVE session counters on the real CLI, so a session
+    // that has not been sent a prompt yet reports zero. Returning the
+    // scenario's post-turn numbers to a pre-turn caller made the fixture
+    // unable to distinguish a session total from a turn cost, which is
+    // exactly the double-counting bug this models.
+    if (!turnsSent) {
+      // `priorMetrics` models resuming a session that already consumed
+      // budget in an earlier turn — the case where storing the session
+      // TOTAL as this job's cost double-counts the earlier job.
+      return scenario.priorMetrics ?? zeroMetrics(scenario.metrics);
+    }
     return scenario.metrics;
   }
 };
@@ -221,9 +254,27 @@ function replayEvents(sessionId) {
     { type: "assistant.usage", data: { premiumRequests: scenario.premiumRequests ?? 1 } },
     { type: "assistant.turn_end", data: { status: "completed" } }
   ];
-  for (const event of events) {
-    emitEvent(sessionId, { id: `evt-${Math.random().toString(36).slice(2)}`, ...event });
-  }
+  // An event may carry `delayMs`, which holds back it AND everything after
+  // it. The real CLI does not stream a whole turn in one synchronous burst,
+  // and a burst cannot reproduce a client-side timing bug: the inferred-
+  // completion fallback only misfires when real time passes between a
+  // message and the tool round that follows it.
+  const emitFrom = (index) => {
+    for (let cursor = index; cursor < events.length; cursor += 1) {
+      const event = events[cursor];
+      const delayMs = Number(event.delayMs);
+      if (Number.isFinite(delayMs) && delayMs > 0) {
+        const { delayMs: _ignored, ...rest } = event;
+        setTimeout(() => {
+          emitEvent(sessionId, { id: `evt-${Math.random().toString(36).slice(2)}`, ...rest });
+          emitFrom(cursor + 1);
+        }, delayMs);
+        return;
+      }
+      emitEvent(sessionId, { id: `evt-${Math.random().toString(36).slice(2)}`, ...event });
+    }
+  };
+  emitFrom(0);
 }
 
 const decode = createMessageDecoder();

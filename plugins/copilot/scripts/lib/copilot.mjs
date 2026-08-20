@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
 
 import { CopilotRpcClient } from "./rpc-client.mjs";
 import { normalizeCatalog } from "./models.mjs";
@@ -66,37 +68,162 @@ const PERMISSION_REQUEST_METHOD_PATTERN = /permission|confirm|approv/i;
 // git.mjs's self-collect path (git.mjs:8, >2 files) routes Copilot through
 // exactly this: it is told to inspect the diff itself with read-only git
 // commands, and a blanket deny turns that into a confident, paid review of
-// a bare file list the model never actually read. This is deliberately a
-// narrow, conservative allowlist of inspection commands rather than an
-// attempt to sandbox arbitrary shell — anything that doesn't unambiguously
-// match falls through to deny, which is the pre-existing, safe behaviour.
-// Anchored at BOTH ends (`^...$`) so a match proves the ENTIRE trimmed
-// command string is one allowlisted invocation, not merely that it starts
-// with one. An earlier version anchored only `^`, matched with `.test()`,
-// and never required the rest of the string to be consumed — `.test()`
-// only needs a match somewhere at position 0, so anything after a
-// recognised "verb + separator" prefix went completely unexamined. Because
-// `\s` matches a literal newline, "git status\nrm -rf /" satisfied that
-// old pattern outright: a documented, verified live bypass (a re-review
-// confirmed it against this exact regex). The argument tail is
-// deliberately restricted to a charset that excludes every character
-// SHELL_CHAIN_PATTERN denies below, so the two checks agree by
-// construction instead of by two independently-maintained lists.
-const READ_ONLY_COMMAND_ALLOWLIST =
-  /^(git\s+(status|diff|log|show|ls-files)\b|ls\b|cat\b|rg\b|grep\b|find\b|head\b|tail\b|wc\b)(\s[^\x00-\x1f;&|`<>\\]*)?$/;
+// a bare file list the model never actually read.
+//
+// Recognising the executable is NOT sufficient. A PR review demonstrated
+// that `find . -delete` cleared every earlier check: `find` is an
+// inspection tool, the string carries no shell metacharacters, and the
+// argument tail was never examined. `find . -exec rm -rf {} +` was worse —
+// `+` is not a shell metacharacter, so the old charset test passed it
+// straight through. `git diff --output=FILE`, `find -fprintf`, and
+// `rg --pre=<cmd>` are the same class of hole: a read-only-looking verb
+// whose ARGUMENTS write files or execute programs.
+//
+// So the policy is a whitelist over the risky surface. Every token that
+// begins with `-` must appear in that command's explicit flag list; a token
+// that does not begin with `-` is a path, pattern, or ref and is
+// unrestricted. This is why `--pre` and `-delete` are refused without ever
+// being named: nothing that is not listed can pass. Blocklisting the
+// dangerous flags instead would require knowing all of them, which is the
+// property that just failed.
+//
+// A false deny is cheap — the model is refused one command and can retry
+// with a simpler one. A false approval runs.
+const READ_ONLY_BASE_COMMANDS = new Set(["ls", "cat", "rg", "grep", "find", "head", "tail", "wc"]);
+const READ_ONLY_GIT_SUBCOMMANDS = new Set(["status", "diff", "log", "show", "ls-files"]);
+
+// `short` letters may be bundled (`-la`). `long` names are matched after
+// stripping any `=value`. `numeric` permits the bare `-5` count form.
+// `patterns` covers value-attached short flags such as `-U3` or `-C2`.
+// `primaries` is find(1)'s single-dash word vocabulary, matched exactly.
+const READ_ONLY_FLAG_POLICY = {
+  ls: {
+    short: "aAdFghlprRStU1",
+    long: ["all", "almost-all", "classify", "color", "group-directories-first", "human-readable", "recursive", "reverse", "size", "time"]
+  },
+  cat: {
+    short: "bEnstTv",
+    long: ["number", "number-nonblank", "show-all", "show-ends", "show-tabs", "squeeze-blank"]
+  },
+  head: {
+    short: "cnqv",
+    long: ["bytes", "lines", "quiet", "silent", "verbose"],
+    numeric: true
+  },
+  // No -f/--follow: it never returns, which would hang the turn until the
+  // absolute ceiling instead of answering the review.
+  tail: {
+    short: "cnqv",
+    long: ["bytes", "lines", "quiet", "silent", "verbose"],
+    numeric: true
+  },
+  wc: {
+    short: "clLmw",
+    long: ["bytes", "chars", "lines", "max-line-length", "words"]
+  },
+  grep: {
+    short: "aABcCEeFGhHiIlLmnoPqrRsvwxz",
+    long: ["after-context", "before-context", "binary-files", "byte-offset", "color", "colour", "context", "count", "exclude", "exclude-dir", "extended-regexp", "files-with-matches", "files-without-match", "fixed-strings", "ignore-case", "include", "invert-match", "line-number", "line-regexp", "max-count", "no-filename", "no-messages", "only-matching", "perl-regexp", "quiet", "recursive", "regexp", "text", "with-filename", "word-regexp"],
+    patterns: [/^-[ABCm]\d+$/]
+  },
+  rg: {
+    // No -z/--search-zip and no --pre/--pre-glob: each hands file contents to
+    // an external program of the caller's choosing, which is execution.
+    short: "aABcCeFghHilLmnNopqsStTuvwx",
+    long: ["after-context", "before-context", "block-buffered", "byte-offset", "case-sensitive", "color", "colors", "column", "context", "count", "count-matches", "files", "files-with-matches", "files-without-match", "fixed-strings", "follow", "glob", "heading", "hidden", "iglob", "ignore-case", "invert-match", "json", "line-number", "line-regexp", "max-columns", "max-count", "max-depth", "maxdepth", "multiline", "multiline-dotall", "no-config", "no-filename", "no-heading", "no-ignore", "no-line-number", "no-messages", "null", "only-matching", "regexp", "smart-case", "sort", "sortr", "text", "trim", "type", "type-not", "vimgrep", "with-filename", "word-regexp"],
+    patterns: [/^-[ABCm]\d+$/]
+  },
+  find: {
+    // Tests and traversal control only. Every ACTION primary that writes or
+    // executes is absent by construction: -delete, -exec, -execdir, -ok,
+    // -okdir, -fprint, -fprint0, -fprintf, -fls.
+    short: "",
+    long: [],
+    primaries: ["-name", "-iname", "-path", "-ipath", "-lname", "-ilname", "-regex", "-iregex", "-regextype", "-type", "-xtype", "-maxdepth", "-mindepth", "-depth", "-mount", "-xdev", "-prune", "-quit", "-print", "-print0", "-printf", "-ls", "-newer", "-newermt", "-anewer", "-cnewer", "-size", "-empty", "-not", "-and", "-or", "-a", "-o", "-true", "-false", "-atime", "-ctime", "-mtime", "-amin", "-cmin", "-mmin", "-user", "-group", "-uid", "-gid", "-nouser", "-nogroup", "-perm", "-readable", "-writable", "-executable", "-samefile", "-inum", "-links", "-follow", "-L", "-H", "-P"]
+  },
+  "git status": {
+    short: "bsuvz",
+    long: ["ahead-behind", "branch", "column", "find-renames", "ignored", "long", "no-column", "no-renames", "porcelain", "renames", "short", "untracked-files", "verbose"]
+  },
+  "git diff": {
+    // No --output / --output-indicator-*: those write files. No --ext-diff:
+    // that runs an external diff program.
+    short: "bBcCDlMpRsStUwWz",
+    long: ["binary", "cached", "color", "compact-summary", "diff-filter", "dirstat", "dst-prefix", "find-copies", "find-renames", "function-context", "ignore-all-space", "ignore-blank-lines", "ignore-space-at-eol", "ignore-space-change", "irreversible-delete", "merge-base", "name-only", "name-status", "no-color", "no-ext-diff", "no-patch", "no-prefix", "no-renames", "numstat", "patch", "raw", "relative", "shortstat", "src-prefix", "staged", "stat", "submodule", "summary", "text", "unified", "word-diff", "word-diff-regex"],
+    patterns: [/^-U\d+$/, /^-M\d+$/, /^-C\d+$/]
+  },
+  "git log": {
+    short: "cEGiLnpsSuUz",
+    long: ["abbrev-commit", "after", "all", "author", "before", "cherry-pick", "color", "committer", "date", "date-order", "decorate", "first-parent", "follow", "format", "graph", "grep", "max-count", "merges", "name-only", "name-status", "no-abbrev-commit", "no-color", "no-decorate", "no-merges", "no-patch", "no-renames", "numstat", "oneline", "patch", "pretty", "relative-date", "reverse", "shortstat", "since", "skip", "stat", "topo-order", "unified", "until"],
+    patterns: [/^-\d+$/, /^-n\d+$/, /^-U\d+$/]
+  },
+  "git show": {
+    short: "cmpsUz",
+    long: ["abbrev-commit", "color", "date", "format", "name-only", "name-status", "no-abbrev-commit", "no-color", "no-patch", "numstat", "oneline", "patch", "pretty", "shortstat", "stat", "unified"],
+    patterns: [/^-U\d+$/]
+  },
+  "git ls-files": {
+    short: "cdikmostuz",
+    long: ["cached", "deleted", "directory", "error-unmatch", "exclude-standard", "full-name", "ignored", "modified", "no-empty-directory", "others", "stage", "unmerged"]
+  }
+};
 
 // Characters that could separate, chain, redirect, or otherwise smuggle a
 // second command past an allowlisted-looking prefix (e.g.
 // "git status; rm -rf ." or "git status\nrm -rf /"). This deliberately
 // includes every C0 control character (`\x00`-`\x1f`), not just the
-// obviously shell-special ones: `\s` in READ_ONLY_COMMAND_ALLOWLIST treats
-// a literal newline or carriage return as an ordinary separator, which a
-// live re-review confirmed was exploitable to run an unreviewed second
-// command in read-only mode ("git status\nrm -rf /" was being approved).
-// Any of these forces a deny regardless of the leading command — prefer a
-// false deny (cheap: the model just gets refused and can retry with a
-// simpler command) to a false approval (not cheap: it runs).
+// obviously shell-special ones: whitespace tokenisation treats a literal
+// newline or carriage return as an ordinary separator, which a live
+// re-review confirmed was exploitable to run an unreviewed second command in
+// read-only mode ("git status\nrm -rf /" was being approved). Any of these
+// forces a deny regardless of the leading command.
 const SHELL_CHAIN_PATTERN = /[\x00-\x1f;&|`<>\\]|\$\(/;
+
+function readOnlyPolicyFor(tokens) {
+  if (tokens[0] === "git") {
+    if (tokens.length < 2 || !READ_ONLY_GIT_SUBCOMMANDS.has(tokens[1])) {
+      return null;
+    }
+    return { policy: READ_ONLY_FLAG_POLICY[`git ${tokens[1]}`], args: tokens.slice(2) };
+  }
+  if (!READ_ONLY_BASE_COMMANDS.has(tokens[0])) {
+    return null;
+  }
+  return { policy: READ_ONLY_FLAG_POLICY[tokens[0]], args: tokens.slice(1) };
+}
+
+function isAllowedFlagToken(token, policy) {
+  // `--` ends option parsing; a lone `-` is the stdin operand.
+  if (token === "--" || token === "-") {
+    return true;
+  }
+
+  if (policy.primaries) {
+    return policy.primaries.includes(token);
+  }
+
+  for (const pattern of policy.patterns ?? []) {
+    if (pattern.test(token)) {
+      return true;
+    }
+  }
+
+  if (token.startsWith("--")) {
+    const name = token.slice(2).split("=")[0];
+    return policy.long.includes(name);
+  }
+
+  if (policy.numeric && /^-\d+$/.test(token)) {
+    return true;
+  }
+
+  // A bundled short-flag run: every letter must be allowed on its own.
+  const letters = token.slice(1);
+  if (!letters || !/^[A-Za-z]+$/.test(letters)) {
+    return false;
+  }
+  return [...letters].every((letter) => policy.short.includes(letter));
+}
 
 // The exact params shape a server permission request carries for a shell/
 // tool command was never confirmed against the real protocol (see the
@@ -131,7 +258,7 @@ function extractRequestedCommand(params) {
   return null;
 }
 
-function isAllowedReadOnlyCommand(command) {
+export function isAllowedReadOnlyCommand(command) {
   if (typeof command !== "string" || !command.trim()) {
     return false;
   }
@@ -139,7 +266,18 @@ function isAllowedReadOnlyCommand(command) {
   if (SHELL_CHAIN_PATTERN.test(trimmed)) {
     return false;
   }
-  return READ_ONLY_COMMAND_ALLOWLIST.test(trimmed);
+
+  const tokens = trimmed.split(/\s+/);
+  const resolved = readOnlyPolicyFor(tokens);
+  if (!resolved?.policy) {
+    return false;
+  }
+
+  // EVERY token is examined, not just the leading verb. This is what closes
+  // the `find . -delete` class of bypass: the old check proved only that the
+  // command STARTED with an inspection tool, never that the rest of it was
+  // harmless.
+  return resolved.args.every((token) => !token.startsWith("-") || isAllowedFlagToken(token, resolved.policy));
 }
 
 // Answers a server permission request per spec §6.3 layer 3
@@ -298,14 +436,38 @@ async function fetchUsageMetrics(client, sessionId) {
 // event-based numbers whenever the metrics call succeeded and returned a
 // number — including 0, a legitimate value for a non-premium model — and
 // fall back to whatever `assistant.usage` events already captured otherwise.
-function mergeUsageMetrics(eventUsage, metrics) {
+//
+// Both fields are SESSION totals, not turn costs. Storing them raw as one
+// job's usage double-counted every resumed session: a rescue follow-up that
+// resumes an earlier Copilot session reported that session's whole running
+// total as its own spend, and summariseJobUsage then added the first job's
+// number a second time — 1 followed by 2 rendered as a 3-request session
+// total when only 2 were consumed. Subtracting a baseline sampled before
+// session.send makes the stored figure the delta this turn actually cost.
+function subtractBaseline(total, baseline) {
+  if (typeof total !== "number") {
+    return null;
+  }
+  if (typeof baseline !== "number") {
+    return total;
+  }
+  // Never report a negative cost: if the counters ever move backwards
+  // (a reset, a different accounting basis), fall back to the raw total
+  // rather than inventing a refund.
+  return total >= baseline ? total - baseline : total;
+}
+
+function mergeUsageMetrics(eventUsage, metrics, baseline = null) {
   if (!metrics) {
     return eventUsage;
   }
-  const premiumRequests =
-    typeof metrics.totalPremiumRequestCost === "number" ? metrics.totalPremiumRequestCost : eventUsage.premiumRequests;
-  const aiu = typeof metrics.totalNanoAiu === "number" ? metrics.totalNanoAiu : eventUsage.aiu;
-  return { ...eventUsage, premiumRequests, aiu };
+  const premium = subtractBaseline(metrics.totalPremiumRequestCost, baseline?.totalPremiumRequestCost);
+  const nanoAiu = subtractBaseline(metrics.totalNanoAiu, baseline?.totalNanoAiu);
+  return {
+    ...eventUsage,
+    premiumRequests: premium ?? eventUsage.premiumRequests,
+    aiu: nanoAiu ?? eventUsage.aiu
+  };
 }
 
 // `codeChanges.filesModified` on session.usage.getMetrics is likely a more
@@ -395,6 +557,10 @@ function createCapture(sessionId, onProgress) {
     reasoning: [],
     touchedFiles: new Set(),
     commandExecutions: [],
+    // Outstanding tool work. The inferred-completion fallback must not fire
+    // while either is live — see scheduleInferredCompletion.
+    activeCommands: 0,
+    toolCallInFlight: false,
     usage: { premiumRequests: null, aiu: null },
     error: null,
     completed: false,
@@ -407,6 +573,18 @@ function createCapture(sessionId, onProgress) {
 
 function scheduleInferredCompletion(capture) {
   if (capture.completed || !capture.sawMessage) {
+    return;
+  }
+  // A model that narrates before it acts ("Let me check the diff…") emits an
+  // assistant.message and THEN calls a tool. Arming the fallback there meant
+  // any tool call lasting longer than INFERRED_COMPLETION_MS resolved the
+  // capture and closed the RPC client mid-round, truncating the review to
+  // the preamble — after the premium request was already paid for.
+  // session.idle remains the authoritative completion signal; this timer is
+  // only a fallback for builds that never send one, so declining to arm it
+  // while work is outstanding costs nothing on the normal path.
+  if (capture.activeCommands > 0 || capture.toolCallInFlight) {
+    clearTimeout(capture.timer);
     return;
   }
   clearTimeout(capture.timer);
@@ -441,6 +619,8 @@ function applyEvent(capture, event) {
       break;
     }
     case "command.execute":
+      capture.activeCommands += 1;
+      clearTimeout(capture.timer);
       emit(
         capture.onProgress,
         `Running command: ${shorten(data.command)}`,
@@ -448,14 +628,19 @@ function applyEvent(capture, event) {
       );
       break;
     case "command.completed":
+      capture.activeCommands = Math.max(0, capture.activeCommands - 1);
+      capture.toolCallInFlight = false;
       capture.commandExecutions.push(data);
       emit(
         capture.onProgress,
         `Command completed: ${shorten(data.command)} (exit ${data.exitCode ?? "?"})`,
         looksLikeVerificationCommand(data.command) ? "verifying" : "running"
       );
+      scheduleInferredCompletion(capture);
       break;
     case "assistant.tool_call_delta":
+      capture.toolCallInFlight = true;
+      clearTimeout(capture.timer);
       emit(capture.onProgress, `Tool call: ${shorten(data.name ?? data.tool)}`, "investigating");
       break;
     case "file.changed":
@@ -504,6 +689,13 @@ function applyEvent(capture, event) {
       // single-round happy path — and any build that never emits
       // session.idle at all — exactly as it did before this fix.
       emit(capture.onProgress, "Turn round completed.", "investigating");
+      // The round is over, so whatever tool it was running has resolved —
+      // clear the in-flight marker and re-arm the fallback, which is what
+      // keeps a build that never emits session.idle from hanging until the
+      // absolute ceiling.
+      capture.toolCallInFlight = false;
+      capture.activeCommands = 0;
+      scheduleInferredCompletion(capture);
       break;
     case "session.idle":
       // The authoritative "the whole agentic turn is done" signal — see the
@@ -692,6 +884,12 @@ export async function runCopilotTurn(cwd, options = {}) {
       throw new Error("A prompt is required for this Copilot run.");
     }
 
+    // Sampled BEFORE the turn so the usage stored on this job is the delta
+    // this turn cost, not the resumed session's running total — see
+    // mergeUsageMetrics. On a fresh session this is zero (or null when the
+    // RPC is unsupported), so the delta equals the total, unchanged.
+    const usageBaseline = await fetchUsageMetrics(client, sessionId);
+
     const send = await client.request("session.send", { sessionId, prompt });
 
     capture.started = true;
@@ -774,7 +972,7 @@ export async function runCopilotTurn(cwd, options = {}) {
       reasoningSummary: capture.reasoning,
       touchedFiles: preferMetricsTouchedFiles([...capture.touchedFiles], metrics),
       commandExecutions: capture.commandExecutions,
-      usage: { ...mergeUsageMetrics(capture.usage, metrics), model: options.model },
+      usage: { ...mergeUsageMetrics(capture.usage, metrics, usageBaseline), model: options.model },
       error: capture.error,
       stderr: client.stderr
     };
@@ -804,14 +1002,32 @@ export async function interruptCopilotTurn(cwd, { sessionId }, options = {}) {
   }
 }
 
+function canonicalDirectory(directory) {
+  const resolved = path.resolve(directory);
+  try {
+    return fs.realpathSync(resolved);
+  } catch {
+    return resolved;
+  }
+}
+
 export async function findLatestTaskSession(cwd, options = {}) {
+  const canonicalCwd = canonicalDirectory(cwd);
   return withClient(cwd, options, async (client) => {
     const response = await client.request("sessions.list", { limit: 20 });
     const match = (response?.sessions ?? []).find(
       (session) =>
         typeof session.name === "string" &&
         session.name.startsWith(TASK_SESSION_PREFIX) &&
-        (!session.context?.cwd || session.context.cwd === cwd)
+        // An exact, canonicalised match is required. Treating a session with
+        // NO recorded cwd as a match for every repository — the previous
+        // behaviour — let `/copilot:rescue --resume` pick up the newest task
+        // session from an unrelated workspace and continue it here, applying
+        // write-capable edits informed by another repository's history. A
+        // session we cannot place is not a session we can safely resume;
+        // starting a fresh one is the cheap, correct failure.
+        typeof session.context?.cwd === "string" &&
+        canonicalDirectory(session.context.cwd) === canonicalCwd
     );
     return match ? { sessionId: match.sessionId } : null;
   });

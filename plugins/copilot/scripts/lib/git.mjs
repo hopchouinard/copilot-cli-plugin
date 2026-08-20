@@ -96,7 +96,15 @@ export function detectDefaultBranch(cwd) {
   if (symbolic.status === 0) {
     const remoteHead = symbolic.stdout.trim();
     if (remoteHead.startsWith("refs/remotes/origin/")) {
-      return remoteHead.replace("refs/remotes/origin/", "");
+      const name = remoteHead.replace("refs/remotes/origin/", "");
+      // origin/HEAD proves the REMOTE-tracking ref exists; it says nothing
+      // about a local branch of the same name. Returning the bare name in a
+      // feature-only checkout (clone, then check out just the branch) hands
+      // callers a ref `git merge-base HEAD <name>` cannot resolve, so an
+      // otherwise valid automatic review fails. Only drop the qualifier once
+      // the local branch is confirmed to exist.
+      const local = git(cwd, ["show-ref", "--verify", "--quiet", `refs/heads/${name}`]);
+      return local.status === 0 ? name : `origin/${name}`;
     }
   }
 
@@ -194,8 +202,43 @@ function formatSection(title, body) {
   return [`## ${title}`, "", body.trim() ? body.trim() : "(none)", ""].join("\n");
 }
 
-function formatUntrackedFile(cwd, relativePath) {
-  const absolutePath = path.join(cwd, relativePath);
+// `git ls-files --others` lists untracked symlinks, and both statSync and
+// readFileSync follow them. An untracked link such as `notes -> ~/.ssh/config`
+// therefore got its TARGET's contents embedded verbatim in the review prompt
+// and shipped to Copilot. Resolve the link first and read it only when it
+// still lands inside the repository; anything pointing outside is named but
+// never read.
+function resolveContainedUntrackedPath(absolutePath, containmentRoot) {
+  let linkStat;
+  try {
+    linkStat = fs.lstatSync(absolutePath);
+  } catch {
+    return { ok: false, note: "broken symlink or unreadable file" };
+  }
+  if (!linkStat.isSymbolicLink()) {
+    return { ok: true, path: absolutePath };
+  }
+
+  let resolved;
+  try {
+    resolved = fs.realpathSync(absolutePath);
+  } catch {
+    return { ok: false, note: "broken symlink" };
+  }
+  const prefix = containmentRoot.endsWith(path.sep) ? containmentRoot : `${containmentRoot}${path.sep}`;
+  if (resolved !== containmentRoot && !resolved.startsWith(prefix)) {
+    return { ok: false, note: "symlink pointing outside the repository" };
+  }
+  return { ok: true, path: resolved };
+}
+
+function formatUntrackedFile(cwd, relativePath, containmentRoot) {
+  const contained = resolveContainedUntrackedPath(path.join(cwd, relativePath), containmentRoot);
+  if (!contained.ok) {
+    return `### ${relativePath}\n(skipped: ${contained.note})`;
+  }
+  const absolutePath = contained.path;
+
   let stat;
   try {
     stat = fs.statSync(absolutePath);
@@ -222,8 +265,17 @@ function formatUntrackedFile(cwd, relativePath) {
   return [`### ${relativePath}`, "```", buffer.toString("utf8").trimEnd(), "```"].join("\n");
 }
 
+function untrackedContainmentRoot(cwd) {
+  try {
+    return fs.realpathSync(getRepoRoot(cwd));
+  } catch {
+    return path.resolve(cwd);
+  }
+}
+
 function collectWorkingTreeContext(cwd, state, options = {}) {
   const includeDiff = options.includeDiff !== false;
+  const containmentRoot = untrackedContainmentRoot(cwd);
   const status = gitChecked(cwd, ["status", "--short", "--untracked-files=all"]).stdout.trim();
   const changedFiles = listUniqueFiles(state.staged, state.unstaged, state.untracked);
 
@@ -231,7 +283,7 @@ function collectWorkingTreeContext(cwd, state, options = {}) {
   if (includeDiff) {
     const stagedDiff = gitChecked(cwd, ["diff", "--cached", "--binary", "--no-ext-diff", "--submodule=diff"]).stdout;
     const unstagedDiff = gitChecked(cwd, ["diff", "--binary", "--no-ext-diff", "--submodule=diff"]).stdout;
-    const untrackedBody = state.untracked.map((file) => formatUntrackedFile(cwd, file)).join("\n\n");
+    const untrackedBody = state.untracked.map((file) => formatUntrackedFile(cwd, file, containmentRoot)).join("\n\n");
     parts = [
       formatSection("Git Status", status),
       formatSection("Staged Diff", stagedDiff),
@@ -241,7 +293,7 @@ function collectWorkingTreeContext(cwd, state, options = {}) {
   } else {
     const stagedStat = gitChecked(cwd, ["diff", "--shortstat", "--cached"]).stdout.trim();
     const unstagedStat = gitChecked(cwd, ["diff", "--shortstat"]).stdout.trim();
-    const untrackedBody = state.untracked.map((file) => formatUntrackedFile(cwd, file)).join("\n\n");
+    const untrackedBody = state.untracked.map((file) => formatUntrackedFile(cwd, file, containmentRoot)).join("\n\n");
     parts = [
       formatSection("Git Status", status),
       formatSection("Staged Diff Stat", stagedStat),

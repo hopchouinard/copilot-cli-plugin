@@ -133,7 +133,7 @@ model tier or naming.
 
 **This table is a snapshot, not a contract.** The plugin never hardcodes it: every multiplier
 shown by `/copilot:setup`, the cost guard, and `/copilot:status` is read live from the Copilot RPC
-`models.list` call, so it moves when GitHub repriced the model.
+`models.list` call, so it moves when GitHub reprices the model.
 
 Two things exist specifically to keep this cost visible:
 
@@ -210,6 +210,16 @@ Examples:
 This command is read-only and never makes changes. When run in the background, use
 [`/copilot:status`](#copilotstatus) to check progress and [`/copilot:cancel`](#copilotcancel) to
 stop it.
+
+Read-only is enforced in three layers, and the outermost one is a command allowlist. When Copilot
+asks to run a shell command during a review, the plugin approves it only if the executable is one
+of `git status`, `git diff`, `git log`, `git show`, `git ls-files`, `ls`, `cat`, `rg`, `grep`,
+`find`, `head`, `tail`, or `wc` **and** every flag it passes appears in that command's explicit
+allowed-flag list. Recognising the executable alone is not enough — `find . -delete` and
+`find . -exec rm -rf {} +` are inspection commands by name and destructive by argument. Anything
+not on the list is denied, and Copilot simply retries with something simpler. If a review reports
+being refused a command you consider harmless, that is this allowlist being conservative on
+purpose: a wrong denial costs a retry, a wrong approval runs.
 
 ### `/copilot:adversarial-review`
 

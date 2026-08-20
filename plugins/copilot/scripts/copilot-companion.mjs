@@ -32,6 +32,7 @@ import {
   validateEffort,
   readUserSettings,
   readRepoSettings,
+  catalogHasModel,
   isCatalogStale,
   cheapestModel
 } from "./lib/models.mjs";
@@ -146,8 +147,15 @@ export async function buildSetupReport(cwd, options = {}) {
   const repoSettings = readRepoSettings(workspaceRoot);
 
   if (options.effort !== undefined) {
-    const probe = resolveModel({ role: "task", config, env: process.env, repoSettings, userSettings });
-    validateEffort(probe.model, options.effort, modelCatalog);
+    // `effort` is ONE setting shared by both roles, so validating it against
+    // the task model alone let setup persist a value the review model does
+    // not accept — after which every review died in validateEffort before it
+    // could run, with the failure surfacing far from the setup call that
+    // caused it. Both resolved models have to accept it.
+    for (const role of ["review", "task"]) {
+      const probe = resolveModel({ role, config, env: process.env, repoSettings, userSettings });
+      validateEffort(probe.model, options.effort, modelCatalog);
+    }
     setConfig(workspaceRoot, "effort", options.effort);
     actionsTaken.push(`Set the default reasoning effort to ${options.effort}.`);
     config = getConfig(workspaceRoot);
@@ -356,7 +364,9 @@ function spawnDetachedTaskWorker(cwd, jobId) {
   return child;
 }
 
-function enqueueBackgroundTask(cwd, workspaceRoot, options, prompt, resumeLast) {
+// Exported so a test can assert the store/spawn ordering directly instead
+// of racing a real detached worker.
+export function enqueueBackgroundTask(cwd, workspaceRoot, options, prompt, resumeLast) {
   // Mint the Copilot session id now, before the worker process exists, so a
   // stored-but-not-yet-running job still carries the id /copilot:cancel
   // needs to interrupt it (spec §6.6 / §3.2). This is stored as
@@ -392,19 +402,32 @@ function enqueueBackgroundTask(cwd, workspaceRoot, options, prompt, resumeLast) 
     copilotSessionId
   };
 
-  const child = spawnDetachedTaskWorker(cwd, job.id);
+  // Publish the job BEFORE the worker exists. Spawning first left a window
+  // in which the detached child could reach handleTaskWorker, find no stored
+  // job, and exit with its stdio discarded — after which the parent wrote a
+  // queued record for a worker that was already dead, leaving a job stuck in
+  // the queue forever with no error anywhere. The pid is patched in once the
+  // child is running.
   const queuedRecord = {
     ...job,
     status: "queued",
     phase: "queued",
-    pid: child.pid ?? null,
+    pid: null,
     logFile,
     request
   };
   writeJobFile(job.workspaceRoot, job.id, queuedRecord);
   upsertJob(job.workspaceRoot, queuedRecord);
 
-  return queuedRecord;
+  // Injectable so a test can observe the store at the exact moment the
+  // worker would start, which is the invariant this ordering exists to hold.
+  const spawnWorker = options.spawnWorker ?? spawnDetachedTaskWorker;
+  const child = spawnWorker(cwd, job.id);
+  const startedRecord = { ...queuedRecord, pid: child?.pid ?? null };
+  writeJobFile(job.workspaceRoot, job.id, startedRecord);
+  upsertJob(job.workspaceRoot, { id: job.id, pid: startedRecord.pid });
+
+  return startedRecord;
 }
 
 // Fix M1: every documented rescue flow lands in the foreground path —
@@ -542,10 +565,10 @@ async function handleTaskResumeCandidate(argv) {
   );
 }
 
-export function buildCostCheck(cwd, options = {}) {
+export async function buildCostCheck(cwd, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const config = getConfig(workspaceRoot);
-  const catalog = config.modelCatalog;
+  let catalog = config.modelCatalog;
 
   const { model, source } = resolveModel({
     role: options.role === "review" ? "review" : "task",
@@ -556,8 +579,30 @@ export function buildCostCheck(cwd, options = {}) {
     userSettings: readUserSettings()
   });
 
+  // This is the last checkpoint before a paid background run, and it was
+  // pricing that run off whatever the cache happened to hold: a catalog past
+  // its TTL, or one that predates the model the user just named. Both make
+  // describeCost report "cost unknown", and an unknown multiplier used to
+  // make exceedsThreshold return false — the expensive-run confirmation was
+  // skipped precisely when the plugin knew least about the cost. Refresh
+  // first when the cache cannot answer for this model.
+  let catalogRefreshed = false;
+  if (options.refreshCatalog !== false && (isCatalogStale(catalog) || !catalogHasModel(model, catalog))) {
+    try {
+      catalog = await fetchModelCatalog(cwd, options);
+      setConfig(workspaceRoot, "modelCatalog", catalog);
+      catalogRefreshed = true;
+    } catch {
+      // Copilot unreachable or too old. Keep the cached catalog; the
+      // unknown-cost branch below is the fail-safe.
+      catalog = config.modelCatalog;
+    }
+  }
+
   const cost = describeCost(model, catalog);
   const cheapest = cheapestModel(catalog);
+  const thresholdActive = Number.isFinite(Number(config.costWarnThreshold)) && Number(config.costWarnThreshold) > 0;
+  const costUnknown = typeof cost.multiplier !== "number";
 
   return {
     model,
@@ -565,7 +610,12 @@ export function buildCostCheck(cwd, options = {}) {
     label: cost.label,
     multiplier: cost.multiplier,
     threshold: config.costWarnThreshold,
-    exceeds: exceedsThreshold(model, catalog, config.costWarnThreshold),
+    // A cost we cannot establish is treated as expensive while the guard is
+    // on. Confirming a run that turns out to be cheap wastes one question;
+    // skipping the question on a run that turns out to be 14x does not.
+    exceeds: costUnknown ? thresholdActive : exceedsThreshold(model, catalog, config.costWarnThreshold),
+    costUnknown,
+    catalogRefreshed,
     cheapest,
     cheapestLabel: cheapest ? describeCost(cheapest, catalog).label : null
   };
@@ -578,7 +628,7 @@ async function handleCostCheck(argv) {
   });
 
   const cwd = options.cwd ? path.resolve(process.cwd(), options.cwd) : process.cwd();
-  const check = buildCostCheck(cwd, options);
+  const check = await buildCostCheck(cwd, options);
   process.stdout.write(`${JSON.stringify(check, null, 2)}\n`);
 }
 

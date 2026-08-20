@@ -24,7 +24,15 @@ export function isCatalogStale(catalog, now = Date.now()) {
   if (!catalog?.cachedAt) {
     return true;
   }
-  return now - Date.parse(catalog.cachedAt) > CATALOG_TTL_MS;
+  // An unparseable cachedAt makes `now - Date.parse(...)` NaN, and every
+  // comparison against NaN is false — so the pre-existing `> TTL` test
+  // reported a corrupted stamp as FRESH and pinned a bad catalog in place
+  // forever. A stamp we cannot read is not evidence of freshness.
+  const cachedAt = Date.parse(catalog.cachedAt);
+  if (!Number.isFinite(cachedAt)) {
+    return true;
+  }
+  return now - cachedAt > CATALOG_TTL_MS;
 }
 
 function configKeyForRole(role) {
@@ -49,6 +57,10 @@ export function resolveModel({ role, flagModel, config = {}, env = {}, repoSetti
   }
 
   return { model: FALLBACK_MODEL, source: "fallback" };
+}
+
+export function catalogHasModel(modelId, catalog) {
+  return Boolean(findModel(modelId, catalog));
 }
 
 function findModel(modelId, catalog) {

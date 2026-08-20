@@ -26,24 +26,24 @@ function tempWorkspace() {
   return cwd;
 }
 
-test("a 9x model trips the default 6x threshold and offers the cheapest alternative", () => {
+test("a 9x model trips the default 6x threshold and offers the cheapest alternative", async () => {
   const cwd = tempWorkspace();
   setConfig(cwd, "reviewModel", "claude-sonnet-4.6");
-  const check = buildCostCheck(cwd, { role: "review" });
+  const check = await buildCostCheck(cwd, { role: "review" });
   assert.equal(check.exceeds, true);
   assert.equal(check.multiplier, 9);
   assert.equal(check.cheapest, "claude-haiku-4.5");
 });
 
-test("a cheap model does not trip the threshold", () => {
+test("a cheap model does not trip the threshold", async () => {
   const cwd = tempWorkspace();
   setConfig(cwd, "reviewModel", "claude-haiku-4.5");
-  assert.equal(buildCostCheck(cwd, { role: "review" }).exceeds, false);
+  assert.equal((await buildCostCheck(cwd, { role: "review" })).exceeds, false);
 });
 
-test("a zero threshold disables the guard", () => {
+test("a zero threshold disables the guard", async () => {
   const cwd = tempWorkspace();
   setConfig(cwd, "reviewModel", "claude-sonnet-4.6");
   setConfig(cwd, "costWarnThreshold", 0);
-  assert.equal(buildCostCheck(cwd, { role: "review" }).exceeds, false);
+  assert.equal((await buildCostCheck(cwd, { role: "review" })).exceeds, false);
 });

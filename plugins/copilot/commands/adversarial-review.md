@@ -62,6 +62,10 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/copilot-companion.mjs" cost-check --role rev
   - `Run in background` — describe it as "proceed at <label>"
   - `Switch to <cheapest>` — describe it as "rerun at <cheapestLabel>"
   - `Cancel`
+- If `costUnknown` is true, `exceeds` is true because the cost could not be established, not because a
+  known multiplier is high. Say so plainly ("the multiplier for <model> could not be read from
+  `models.list`") rather than quoting a figure, and omit the `Switch to <cheapest>` option when
+  `cheapest` is null.
 - If the user picks the cheaper model, append `--model <cheapest>` to the companion command.
 - If the user cancels, do not launch anything and say so.
 - Foreground runs never ask. State the cost and run.

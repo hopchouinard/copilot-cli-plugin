@@ -46,6 +46,38 @@ export function renderSetupReport(report) {
 
 const SEVERITY_ORDER = { critical: 0, high: 1, medium: 2, low: 3 };
 
+// Copilot has no output-schema parameter, so the review contract is enforced
+// by the prompt alone and `JSON.parse` succeeding proves nothing about shape.
+// Valid-but-wrong JSON — `findings` as an object, or a bare string — used to
+// reach the renderer, where spreading a non-iterable threw AFTER the premium
+// request had already been paid for: the job was marked failed and the raw
+// review the user paid for was discarded. Anything that does not conform is
+// routed down the existing raw-output path instead, so the text always
+// survives.
+export function describeReviewShape(value) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return "expected a JSON object";
+  }
+  if (value.findings !== undefined && !Array.isArray(value.findings)) {
+    return "`findings` must be an array";
+  }
+  if (value.next_steps !== undefined && !Array.isArray(value.next_steps)) {
+    return "`next_steps` must be an array";
+  }
+  if (typeof value.verdict !== "string" || !value.verdict.trim()) {
+    return "`verdict` must be a non-empty string";
+  }
+  if (typeof value.summary !== "string") {
+    return "`summary` must be a string";
+  }
+  for (const [index, finding] of (value.findings ?? []).entries()) {
+    if (finding === null || typeof finding !== "object" || Array.isArray(finding)) {
+      return `findings[${index}] must be an object`;
+    }
+  }
+  return null;
+}
+
 export function renderReviewResult(parsed, options = {}) {
   const lines = [`# ${options.reviewLabel} — ${options.targetLabel}`, ""];
 
@@ -60,10 +92,11 @@ export function renderReviewResult(parsed, options = {}) {
     lines.push("");
   }
 
-  if (!parsed.parsed) {
+  const shapeError = parsed.parsed ? describeReviewShape(parsed.parsed) : null;
+  if (!parsed.parsed || shapeError) {
     lines.push("Copilot did not return parseable JSON.");
     lines.push("");
-    lines.push(`Parse error: ${parsed.parseError}`);
+    lines.push(`Parse error: ${shapeError ? `response did not match the review schema: ${shapeError}` : parsed.parseError}`);
     lines.push("");
     lines.push("Raw output:");
     lines.push("");

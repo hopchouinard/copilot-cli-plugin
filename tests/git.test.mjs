@@ -145,7 +145,7 @@ test("collectReviewContext skips broken untracked symlinks instead of crashing",
 
   assert.equal(target.mode, "working-tree");
   assert.match(context.content, /### broken-link/);
-  assert.match(context.content, /skipped: broken symlink or unreadable file/i);
+  assert.match(context.content, /skipped: broken symlink/i);
 });
 
 test("collectReviewContext falls back to lightweight context for larger adversarial reviews", () => {

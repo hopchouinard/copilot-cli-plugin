@@ -1,5 +1,39 @@
 # Changelog
 
+## Unreleased
+
+Fixes for every finding raised on PR #1 by the GitHub Copilot and Codex reviewers.
+
+Security:
+- Read-only reviews now validate command **arguments**, not just the executable. Each allowed
+  command carries an explicit flag whitelist, so `find . -delete`, `find . -exec rm -rf {} +`,
+  `git diff --output=FILE`, and `rg --pre=<cmd>` are refused instead of approved.
+- Untracked symlinks are resolved and containment-checked before being read, so a link such as
+  `secrets -> ~/.ssh/id_rsa` is listed but never sent to Copilot.
+- `--resume` requires an exact, canonicalised working-directory match. A session with no recorded
+  directory previously matched every repository and could be continued in the wrong one.
+
+Correctness:
+- The stop-time review gate no longer allows a session to end silently when Copilot is missing or
+  logged out, and its internal-error block decision now exits 0 so Claude Code actually applies it.
+- Per-job premium usage is recorded as the delta for that turn rather than the resumed session's
+  running total, which was double-counted in session totals.
+- The inferred-completion fallback no longer fires while a tool call is in flight, which truncated
+  turns from models that narrate before acting.
+- `state.json` is published atomically and its read-modify-write is serialized by an interprocess
+  lock; a torn read previously rebuilt the file from an empty default and deleted every tracked
+  job's files.
+- Background jobs are persisted before their worker is spawned, closing a race that could strand a
+  job in the queue forever.
+- The cost guard refreshes a stale or incomplete model roster before pricing a run, and treats an
+  unknown multiplier as exceeding the threshold rather than silently bypassing the confirmation.
+- A catalog with an unparseable `cachedAt` is treated as stale rather than as permanently fresh.
+- `/copilot:setup --effort` validates against both the review and task models, not the task model
+  alone.
+- The default branch keeps its `origin/` qualifier when no local branch of that name exists.
+- Review output that parses as JSON but does not match the schema falls back to raw output instead
+  of throwing after the premium request was already spent.
+
 ## 0.1.0
 
 - Initial version of the Copilot plugin for Claude Code

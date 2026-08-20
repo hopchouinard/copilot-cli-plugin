@@ -38,6 +38,10 @@ function emitDecision(payload) {
   process.stdout.write(`${JSON.stringify(payload)}\n`);
 }
 
+function joinNotes(...notes) {
+  return notes.filter(Boolean).join(" ");
+}
+
 function logNote(message) {
   if (!message) {
     return;
@@ -129,7 +133,7 @@ function runStopReview(cwd, input = {}) {
     return {
       ok: false,
       reason:
-        "The stop-time Copilot review task timed out after 15 minutes. Run /copilot:rescue --wait manually or bypass the gate.",
+        `The stop-time Copilot review task timed out after ${STOP_REVIEW_TIMEOUT_MS / 60000} minutes. Run /copilot:rescue --wait manually or bypass the gate.`,
       usage: null
     };
   }
@@ -190,8 +194,20 @@ async function main() {
 
   const setupNote = await buildSetupNote(cwd);
   if (setupNote) {
+    // The gate is enabled and cannot run. Returning with no decision is a
+    // silent allow, which is the single failure mode this gate exists to
+    // prevent — and it contradicts every other failure path here (a
+    // timeout, a non-zero exit, malformed output, an internal crash all
+    // block). An unusable gate must say so loudly, not wave the turn
+    // through; /copilot:setup --disable-review-gate is the way out.
     logNote(setupNote);
-    logNote(runningTaskNote);
+    emitDecision({
+      decision: "block",
+      reason: joinNotes(
+        runningTaskNote,
+        `${setupNote} The stop-time review gate is enabled but cannot run, so this turn has not been reviewed. Fix the setup or run /copilot:setup --disable-review-gate.`
+      )
+    });
     return;
   }
 
@@ -201,7 +217,7 @@ async function main() {
   if (!review.ok) {
     emitDecision({
       decision: "block",
-      reason: runningTaskNote ? `${runningTaskNote} ${review.reason}` : review.reason
+      reason: joinNotes(runningTaskNote, review.reason)
     });
     return;
   }
@@ -221,6 +237,12 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       decision: "block",
       reason: `The stop-time review gate hit an unexpected internal error and cannot confirm the previous turn is safe to stop on: ${message}`
     });
-    process.exitCode = 1;
+    // Exit 0, NOT 1. Claude Code only parses a hook's stdout as a structured
+    // decision when the hook exits 0; exit 2 is the separate stderr-based
+    // blocking channel, and every other non-zero status is a non-blocking
+    // failure whose stdout is discarded. Exiting 1 here therefore threw away
+    // the block payload written one line above and let the session stop —
+    // the fail-closed path failing open.
+    process.exitCode = 0;
   });
 }
