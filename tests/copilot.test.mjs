@@ -162,6 +162,119 @@ test(
   }
 );
 
+// Regression coverage for the read-only permission deadlock found in Task
+// 16 acceptance testing: the real Copilot CLI sends a server→client request
+// when a read-only session (`requestPermission: true`) wants to run a tool,
+// and the client used to silently drop it as a notification, leaving the
+// server's turn blocked forever. These assert the turn still completes
+// (a hang would fail these tests on their timeout) and that the reply's
+// decision matches the turn's read-only posture.
+test(
+  "a server permission request during a read-only turn is answered with a denial, not silence",
+  { timeout: 5000 },
+  async () => {
+    const capture = withCaptureScenario({ serverRequest: { method: "session.permissions.confirm" } });
+    const result = await runCopilotTurn(process.cwd(), {
+      prompt: "investigate",
+      model: "claude-haiku-4.5",
+      readOnly: true,
+      ...capture
+    });
+    assert.equal(result.status, 0, "the turn must complete rather than hang");
+
+    const reply = readCapturedCalls(capture.capturePath).find((call) => call.method === "__serverRequestReply");
+    assert.ok(reply, "expected the client to reply to the server request");
+    assert.ok(!reply.params.error, "a recognised permission-like method must not be refused");
+    assert.equal(reply.params.result.approved, false, "a read-only turn must deny the permission request");
+  }
+);
+
+test(
+  "a server permission request during a write-capable turn is answered with an allow",
+  { timeout: 5000 },
+  async () => {
+    const capture = withCaptureScenario({ serverRequest: { method: "session.permissions.confirm" } });
+    const result = await runCopilotTurn(process.cwd(), {
+      prompt: "fix it",
+      model: "claude-haiku-4.5",
+      readOnly: false,
+      ...capture
+    });
+    assert.equal(result.status, 0);
+
+    const reply = readCapturedCalls(capture.capturePath).find((call) => call.method === "__serverRequestReply");
+    assert.ok(reply);
+    assert.equal(reply.params.result.approved, true, "a write-capable turn must allow the permission request");
+  }
+);
+
+test(
+  "a server request for an unrecognised method still gets an explicit refusal, not silence",
+  { timeout: 5000 },
+  async () => {
+    const capture = withCaptureScenario({ serverRequest: { method: "some.other.thing" } });
+    const result = await runCopilotTurn(process.cwd(), {
+      prompt: "investigate",
+      model: "claude-haiku-4.5",
+      readOnly: true,
+      ...capture
+    });
+    assert.equal(result.status, 0, "an unrecognised server request must not hang the turn either");
+
+    const reply = readCapturedCalls(capture.capturePath).find((call) => call.method === "__serverRequestReply");
+    assert.ok(reply, "expected a reply even for an unrecognised method");
+    assert.ok(reply.params.error, "an unrecognised method must be refused explicitly rather than guessed at");
+  }
+);
+
+// Regression coverage for the inert premium-accounting finding: the real
+// Copilot CLI never populated assistant.usage or session.shutdown, but does
+// answer session.usage.getMetrics with real numbers. These assert
+// runCopilotTurn prefers that RPC's numbers, and falls back cleanly when
+// it's unavailable (an older CLI, or — as here — the fixture not
+// implementing it).
+test("runCopilotTurn prefers session.usage.getMetrics over assistant.usage when both are present", async () => {
+  const result = await runCopilotTurn(process.cwd(), {
+    prompt: "review this",
+    model: "claude-haiku-4.5",
+    readOnly: true,
+    ...withScenario({
+      finalMessage: "no findings",
+      premiumRequests: 1,
+      metrics: { totalPremiumRequestCost: 3, totalNanoAiu: 7000 }
+    })
+  });
+  assert.equal(result.usage.premiumRequests, 3);
+  assert.equal(result.usage.aiu, 7000);
+});
+
+test("runCopilotTurn falls back to the event-based usage when session.usage.getMetrics is unsupported", async () => {
+  const result = await runCopilotTurn(process.cwd(), {
+    prompt: "review this",
+    model: "claude-haiku-4.5",
+    readOnly: true,
+    ...withScenario({ finalMessage: "no findings", premiumRequests: 2, metricsUnsupported: true })
+  });
+  assert.equal(result.usage.premiumRequests, 2);
+});
+
+test("runCopilotTurn prefers codeChanges.filesModified from the metrics call when it is a non-empty string array", async () => {
+  const result = await runCopilotTurn(process.cwd(), {
+    prompt: "fix it",
+    model: "claude-haiku-4.5",
+    readOnly: false,
+    ...withScenario({
+      finalMessage: "done",
+      metrics: {
+        totalPremiumRequestCost: 1,
+        totalNanoAiu: 100,
+        codeChanges: { filesModified: ["src/a.js", "src/b.js"] }
+      }
+    })
+  });
+  assert.deepEqual(result.touchedFiles, ["src/a.js", "src/b.js"]);
+});
+
 test("parseStructuredOutput strips a fenced code block before parsing", () => {
   const parsed = parseStructuredOutput('```json\n{"verdict":"approve"}\n```');
   assert.equal(parsed.parseError, null);

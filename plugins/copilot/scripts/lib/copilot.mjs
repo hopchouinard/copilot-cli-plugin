@@ -13,6 +13,57 @@ const INFERRED_COMPLETION_MS = 250;
 const NOT_INSTALLED =
   "GitHub Copilot CLI is not installed or is too old. Install it with `npm install -g @github/copilot`, then rerun `/copilot:setup`.";
 
+// Matches the server→client request the real Copilot CLI sends when a
+// session was created with `requestPermission: true` and the model wants to
+// run a tool. The exact method name was never documented anywhere this
+// plugin was built from (spec §6.3 names the RPC parameter, not the request
+// it provokes), so this matches broadly on the vocabulary GitHub's other
+// dotted RPC names use for this concept ("permission", "confirm", "approve")
+// rather than a single hardcoded string.
+const PERMISSION_REQUEST_METHOD_PATTERN = /permission|confirm|approv/i;
+
+// Answers a server permission request per spec §6.3 layer 3
+// ("deny-by-default permissions"): deny for a read-only turn, allow for a
+// write-capable one. The exact expected reply shape is unconfirmed against
+// the real protocol (see the comment above), so this returns several
+// differently-named boolean/string fields that cover the plausible shapes
+// (`decision`, `approved`, `allow`, `behavior`) — harmless extra keys in a
+// JSON-RPC result are ignored by a spec-conformant server, but a *missing*
+// key the server actually reads would silently misbehave, which this hedges
+// against until a live run confirms the real shape.
+function buildPermissionResponse(readOnly) {
+  const allow = !readOnly;
+  return {
+    decision: allow ? "allow" : "deny",
+    approved: allow,
+    allow,
+    behavior: allow ? "allow" : "deny"
+  };
+}
+
+// Registered as the RPC client's server-request handler for the duration of
+// a turn. Every server→client request must get a reply (see rpc-client.mjs);
+// this is the policy for what that reply is. Anything that doesn't look like
+// a permission request is refused explicitly (thrown, which rpc-client.mjs
+// turns into a JSON-RPC error reply) rather than guessed at — an explicit
+// refusal surfaces as a loud failure the server can act on, instead of a
+// silently wrong answer.
+function createServerRequestHandler({ readOnly, onProgress }) {
+  return (message) => {
+    const { method, params } = message;
+    emit(onProgress, `Server request: ${method}`, "investigating", {
+      logTitle: "Server request",
+      logBody: JSON.stringify(params ?? {}, null, 2)
+    });
+
+    if (!PERMISSION_REQUEST_METHOD_PATTERN.test(String(method ?? ""))) {
+      throw new Error(`Unsupported server request: ${method}`);
+    }
+
+    return buildPermissionResponse(readOnly);
+  };
+}
+
 function shorten(text, limit = 96) {
   const normalized = String(text ?? "").trim().replace(/\s+/g, " ");
   return normalized.length <= limit ? normalized : `${normalized.slice(0, limit - 3)}...`;
@@ -22,6 +73,53 @@ function looksLikeVerificationCommand(command) {
   return /\b(test|tests|lint|build|typecheck|type-check|check|verify|validate|pytest|jest|vitest|cargo test|npm test|pnpm test|yarn test|go test|tsc|eslint|ruff)\b/i.test(
     String(command ?? "")
   );
+}
+
+// See the call site in runCopilotTurn for why this exists: `assistant.usage`
+// and `session.shutdown` were both empty against the real Copilot CLI, but
+// `session.usage.getMetrics` returns real numbers when probed live. Failure
+// here (unsupported method, closed client, etc.) must never throw — it is a
+// best-effort supplement to the event-based capture, not a requirement.
+async function fetchUsageMetrics(client, sessionId) {
+  try {
+    return await client.request("session.usage.getMetrics", { sessionId });
+  } catch {
+    return null;
+  }
+}
+
+// `totalPremiumRequestCost` / `totalNanoAiu` take priority over the
+// event-based numbers whenever the metrics call succeeded and returned a
+// number — including 0, a legitimate value for a non-premium model — and
+// fall back to whatever `assistant.usage` events already captured otherwise.
+function mergeUsageMetrics(eventUsage, metrics) {
+  if (!metrics) {
+    return eventUsage;
+  }
+  const premiumRequests =
+    typeof metrics.totalPremiumRequestCost === "number" ? metrics.totalPremiumRequestCost : eventUsage.premiumRequests;
+  const aiu = typeof metrics.totalNanoAiu === "number" ? metrics.totalNanoAiu : eventUsage.aiu;
+  return { ...eventUsage, premiumRequests, aiu };
+}
+
+// `codeChanges.filesModified` on session.usage.getMetrics is likely a more
+// complete touched-files source than the `file.changed` event tracking, but
+// its non-empty shape was never observed live (only an empty array was
+// probed). Only prefer it when it is unambiguously a non-empty array of
+// path strings — render.mjs interpolates each entry directly into a
+// Markdown line, so anything else silently produces "- [object Object]".
+// Otherwise keep the event-based list; this is a supplement, not a forced
+// replacement.
+function preferMetricsTouchedFiles(eventFiles, metrics) {
+  const filesModified = metrics?.codeChanges?.filesModified;
+  if (
+    Array.isArray(filesModified) &&
+    filesModified.length > 0 &&
+    filesModified.every((entry) => typeof entry === "string")
+  ) {
+    return filesModified;
+  }
+  return eventFiles;
 }
 
 function emit(onProgress, message, phase = null, extra = {}) {
@@ -238,6 +336,13 @@ export async function runCopilotTurn(cwd, options = {}) {
       applyEvent(capture, message.params.event);
     });
 
+    // Spec §6.3 layer 3: with `requestPermission: true` below, the server
+    // blocks each tool call on a reply to a server→client request. Without
+    // this handler that request goes unanswered and the turn deadlocks
+    // forever (see rpc-client.mjs's handleServerRequest for the transport
+    // half of this fix).
+    client.setServerRequestHandler(createServerRequestHandler({ readOnly: Boolean(options.readOnly), onProgress: options.onProgress }));
+
     if (resuming) {
       emit(options.onProgress, `Resuming session ${sessionId}.`, "starting");
       await client.request("session.resume", {
@@ -287,6 +392,17 @@ export async function runCopilotTurn(cwd, options = {}) {
 
     await capture.promise;
 
+    // Fix C (Task 16 follow-up): `assistant.usage` events and `session.shutdown`
+    // (which only fires on session.destroy, which this function never calls)
+    // both returned nothing against the real Copilot CLI — every real turn in
+    // acceptance testing came back with usage.premiumRequests: null.
+    // `session.usage.getMetrics` was probed live and does return real numbers,
+    // so query it once the turn has resolved, before the client closes. This
+    // is additive: if the query fails (e.g. the test fixture doesn't implement
+    // it, or an older CLI predates this RPC), the event-based capture.usage
+    // stays exactly as it was.
+    const metrics = await fetchUsageMetrics(client, sessionId);
+
     return {
       status: capture.error ? 1 : 0,
       sessionId,
@@ -294,9 +410,9 @@ export async function runCopilotTurn(cwd, options = {}) {
       messageId: send?.messageId ?? null,
       finalMessage: capture.finalMessage,
       reasoningSummary: capture.reasoning,
-      touchedFiles: [...capture.touchedFiles],
+      touchedFiles: preferMetricsTouchedFiles([...capture.touchedFiles], metrics),
       commandExecutions: capture.commandExecutions,
-      usage: { ...capture.usage, model: options.model },
+      usage: { ...mergeUsageMetrics(capture.usage, metrics), model: options.model },
       error: capture.error,
       stderr: client.stderr
     };

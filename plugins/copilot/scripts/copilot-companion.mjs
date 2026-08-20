@@ -256,6 +256,7 @@ async function executeReview(cwd, options, { reviewLabel, template }) {
       costLabel: describeCost(model, catalog).label,
       usage: result.usage
     }),
+    summary: `${reviewLabel}: ${target.label}`,
     usage: result.usage
   };
 }
@@ -622,7 +623,34 @@ async function handleReview(argv, config) {
     );
   }
 
-  const execution = await executeReview(cwd, { ...options, focusText }, config);
+  // Fix B (Task 16 follow-up): route reviews through the same job-tracking
+  // machinery `task` uses (runTrackedJob), so a review — foreground or
+  // backgrounded by Claude Code's Bash tool — appears in `/copilot:status`
+  // and its result is retrievable via `/copilot:result`, exactly as
+  // review.md tells the user it will. Previously executeReview ran with no
+  // job record at all: status/result could never show a review.
+  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  const jobKind = config.template === "adversarial-review" ? "adversarial-review" : "review";
+  const job = createJobRecord({
+    id: generateJobId("review"),
+    kind: jobKind,
+    kindLabel: jobKind,
+    title: config.reviewLabel,
+    workspaceRoot,
+    jobClass: "review",
+    summary: config.reviewLabel
+  });
+  const logFile = createJobLogFile(job.workspaceRoot, job.id, job.title);
+  const onProgress = createProgressReporter({
+    logFile,
+    onEvent: createJobProgressUpdater(workspaceRoot, job.id)
+  });
+
+  const execution = await runTrackedJob(
+    { ...job, logFile },
+    () => executeReview(cwd, { ...options, focusText, onProgress }, config),
+    { logFile }
+  );
   process.stdout.write(options.json ? `${JSON.stringify(execution.payload, null, 2)}\n` : execution.rendered);
   if (execution.exitStatus !== 0) {
     process.exitCode = execution.exitStatus;

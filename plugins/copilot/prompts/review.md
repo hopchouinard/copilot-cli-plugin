@@ -45,6 +45,12 @@ If the change looks correct, say so directly and return no findings.
 <structured_output_contract>
 Return ONLY a single JSON object. No prose before it, no prose after it.
 Do not wrap it in a Markdown code fence.
+A response that begins with anything other than `{` is invalid and unusable —
+that includes an acknowledgement, a statement of intent ("I'll analyze...",
+"Let me look at...", "First, I'll..."), or any other sentence. There is no
+step where you narrate what you are about to do. If you need to look at
+something before answering, do that silently, then respond with the JSON
+object and nothing else.
 It must match this JSON Schema exactly:
 
 {{OUTPUT_SCHEMA}}
@@ -56,3 +62,9 @@ Use `approve` when you found nothing material.
 <repository_context>
 {{REVIEW_INPUT}}
 </repository_context>
+
+<output_reminder>
+Respond now. Your entire response must be exactly one JSON object conforming
+to the schema above, and nothing else — no leading sentence, no trailing
+commentary, no code fence. The first character you output must be `{`.
+</output_reminder>

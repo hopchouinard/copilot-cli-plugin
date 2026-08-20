@@ -52,6 +52,23 @@ function recordCall(method, params) {
   }
 }
 
+// Lets a scenario simulate the real CLI's server→client requests (e.g. a
+// tool-call permission request under `requestPermission: true`) — the exact
+// bug Task 16 found the client silently dropping. `session.send` below
+// optionally sends one of these before replaying the normal event stream, so
+// a test can assert the client answers it (and answers it correctly) rather
+// than hanging.
+let nextServerRequestId = 1;
+const pendingServerRequests = new Map();
+
+function sendServerRequest(sessionId, method, params = {}) {
+  const id = `srv-${nextServerRequestId++}`;
+  return new Promise((resolve) => {
+    pendingServerRequests.set(id, resolve);
+    send({ jsonrpc: "2.0", id, method, params: { sessionId, ...params } });
+  });
+}
+
 // The real Copilot CLI rejects `session.resume` for an id it has never
 // created (probed live against Copilot 1.0.80: `-32603 "Session not found:
 // <id>"`). Track which ids this fixture process actually knows about so a
@@ -112,8 +129,32 @@ const handlers = {
     return { success: true };
   },
   "session.send": (params) => {
-    queueMicrotask(() => replayEvents(params.sessionId));
+    queueMicrotask(async () => {
+      if (scenario.serverRequest) {
+        const reply = await sendServerRequest(
+          params.sessionId,
+          scenario.serverRequest.method,
+          scenario.serverRequest.params ?? {}
+        );
+        recordCall("__serverRequestReply", reply);
+      }
+      replayEvents(params.sessionId);
+    });
     return { messageId: "msg-1" };
+  },
+  // Unimplemented unless a scenario opts in with `metrics`, matching every
+  // real CLI build most of this test suite was written against before this
+  // RPC's existence was confirmed live (Task 16). Answering it by default
+  // for every scenario would silently change what every pre-existing
+  // event-based usage test observes — session.usage.getMetrics would
+  // override assistant.usage's numbers even for tests that never intended
+  // to exercise it.
+  "session.usage.getMetrics": (params) => {
+    recordCall("session.usage.getMetrics", params);
+    if (!scenario.metrics || scenario.metricsUnsupported) {
+      throw new RpcError(-32601, "Unknown method: session.usage.getMetrics");
+    }
+    return scenario.metrics;
   }
 };
 
@@ -133,6 +174,17 @@ function replayEvents(sessionId) {
 const decode = createMessageDecoder();
 process.stdin.on("data", (chunk) => {
   for (const message of decode(chunk)) {
+    // A response to a request *this fixture* sent (sendServerRequest above)
+    // carries an id but no method — route it to the waiting resolver rather
+    // than falling into the "unknown method" branch below, which would
+    // otherwise misinterpret it as a request the fixture itself must answer.
+    if (message.id !== undefined && message.method === undefined && pendingServerRequests.has(message.id)) {
+      const resolve = pendingServerRequests.get(message.id);
+      pendingServerRequests.delete(message.id);
+      resolve(message);
+      continue;
+    }
+
     if (message.id === undefined) {
       continue;
     }

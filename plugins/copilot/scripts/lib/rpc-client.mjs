@@ -55,6 +55,7 @@ export class CopilotRpcClient {
     this.exitResolved = false;
     this.serverVersion = null;
     this.notificationHandler = null;
+    this.serverRequestHandler = null;
     this.decode = createMessageDecoder();
     this.exitPromise = new Promise((resolve) => {
       this.resolveExit = resolve;
@@ -132,6 +133,21 @@ export class CopilotRpcClient {
   }
 
   handleMessage(message) {
+    // A message carrying both an `id` and a `method` is a server→client
+    // *request* — the server is asking us something (e.g. tool-call
+    // permission under `requestPermission: true`) and is blocked waiting
+    // for a reply with that same `id`. This must never be routed to the
+    // notification handler: notifications have no `id` and expect no
+    // reply, so silently treating a request as one leaves the server
+    // waiting forever. This was exactly the cause of the read-only
+    // permission deadlock discovered in acceptance testing (Task 16):
+    // every server request was dropped as a notification and never
+    // answered.
+    if (message.id !== undefined && message.method) {
+      this.handleServerRequest(message);
+      return;
+    }
+
     if (message.id !== undefined && !message.method) {
       const pending = this.pending.get(message.id);
       if (!pending) {
@@ -151,6 +167,45 @@ export class CopilotRpcClient {
     if (message.method) {
       this.notificationHandler?.(message);
     }
+  }
+
+  // Answers a server→client request. A request must always get a reply —
+  // an unanswered one blocks the server's turn indefinitely, with no
+  // timeout and no visible error. If no handler is registered, or the
+  // handler throws (e.g. it doesn't recognise the method), reply with an
+  // explicit JSON-RPC error rather than staying silent — an error at
+  // least lets the server's turn fail loudly instead of hanging.
+  handleServerRequest(message) {
+    const respond = (result) => {
+      if (this.closed || this.exitResolved) {
+        return;
+      }
+      this.proc.stdin.write(encodeMessage({ jsonrpc: "2.0", id: message.id, result: result ?? null }));
+    };
+    const respondError = (code, errorMessage) => {
+      if (this.closed || this.exitResolved) {
+        return;
+      }
+      this.proc.stdin.write(
+        encodeMessage({ jsonrpc: "2.0", id: message.id, error: { code, message: errorMessage } })
+      );
+    };
+
+    if (!this.serverRequestHandler) {
+      respondError(-32601, `No handler registered for server request: ${message.method}`);
+      return;
+    }
+
+    Promise.resolve()
+      .then(() => this.serverRequestHandler(message))
+      .then(respond)
+      .catch((error) =>
+        respondError(-32603, error instanceof Error ? error.message : String(error))
+      );
+  }
+
+  setServerRequestHandler(handler) {
+    this.serverRequestHandler = handler;
   }
 
   handleExit(error) {
