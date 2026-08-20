@@ -1,6 +1,6 @@
 # Copilot plugin for Claude Code — design
 
-Date: 2026-08-18
+Date: 2026-08-18 (model-selection amendment 2026-08-19)
 Status: approved, ready for implementation planning
 
 ## 1. Purpose
@@ -129,6 +129,65 @@ Observed `session.event` types relevant to this plugin: `session.start`,
 `assistant.tool_call_delta`, `assistant.turn_end`, `assistant.usage`,
 `command.execute`, `command.completed`, `agent_completed`, `agent_idle`.
 
+### 3.9 The RPC layer resolves no default model
+
+`session.create` with no `model` parameter succeeds, but leaves the session
+without a resolved model:
+
+```
+session.create { sessionId, workingDirectory }   → no error
+session.metadata.snapshot                        → selectedModel: undefined
+session.model.getCurrent                         → {}
+```
+
+The user's configured default in `~/.copilot/settings.json` (`{ "model":
+"claude-haiku-4.5" }` on the probed machine) is **not** picked up by the
+headless session.
+
+This is the behavioural difference from Codex most likely to cause a bad outcome
+if ignored. Codex resolves `model: null` against `~/.codex/config.toml` and
+project `.codex/config.toml`, which is why the reference plugin can pass `null`
+everywhere and document "if you do not pass `--model`, Codex chooses its own
+defaults". That sentence has no valid Copilot translation.
+
+Not proven: whether resolution happens at `session.send` time rather than at
+create time. Establishing that costs a premium request, and the answer does not
+change the design — an unresolved model means an unpredictable model and an
+unknowable cost, so the plugin resolves the model itself and always sends it
+explicitly.
+
+### 3.10 Model choice is a 56x cost swing, and effort levels are per-model
+
+`models.list` reports `billing.multiplier` and
+`capabilities.supports.reasoning_effort` per model. Measured on CLI 1.0.80:
+
+| Model | Multiplier | `reasoning_effort` |
+|---|---|---|
+| `mai-code-1.1-flash` | 0.25 | low, medium, high |
+| `claude-haiku-4.5` | 0.33 | *unsupported* |
+| `gpt-5-mini` | 0.33 | low, medium, high |
+| `mai-code-1-flash-picker` | 0.33 | low, medium, high |
+| `auto` | 10% discount | *unsupported* |
+| `claude-sonnet-4.5` | 6 | *unsupported* |
+| `gpt-5.4` | 6 | none, low, medium, high, xhigh |
+| `gpt-5.4-mini` | 6 | none, low, medium, high, xhigh |
+| `gpt-5.3-codex` | 6 | low, medium, high, xhigh |
+| `gemini-3.1-pro-preview` | 6 | low, medium, high |
+| `claude-sonnet-4.6` | 9 | low, medium, high, max |
+| `gemini-3.5-flash` | 14 | minimal, low, medium, high |
+
+Two consequences.
+
+First, a background adversarial review on `claude-sonnet-4.6` costs 27 times the
+same review on `claude-haiku-4.5`. Model selection is a cost decision, not only
+a quality decision, and the multiplier is knowable *before* the run.
+
+Second, there is no single valid effort vocabulary. Codex accepts
+`none | minimal | low | medium | high | xhigh` for every model. Copilot's set
+varies per model: `claude-sonnet-4.6` has `max` but not `xhigh`,
+`gemini-3.5-flash` has `minimal`, and two of the twelve models accept no
+reasoning effort at all. A fixed effort enum would be wrong.
+
 ## 4. Design decisions
 
 | # | Decision | Rationale |
@@ -139,7 +198,13 @@ Observed `session.event` types relevant to this plugin: `session.start`,
 | D4 | One review engine, two prompt templates | §3.3 leaves no native reviewer to special-case. |
 | D5 | JSON contract in the prompt, defensive parse | §3.4. Mirrors the reference plugin's existing `parseStructuredOutput` fallback behaviour. |
 | D6 | Digest-priming transfer | §3.5. Lossy but honest; the command output says so. |
-| D7 | Per-job premium-request accounting | §3.7. The only intentional departure from parity. Background jobs make quota consumption easy to lose track of; surfacing it is the difference between a usable tool and a quota leak. |
+| D7 | Per-job premium-request accounting | §3.7. Background jobs make quota consumption easy to lose track of; surfacing it is the difference between a usable tool and a quota leak. |
+| D8 | The plugin resolves model and effort itself and always sends them explicitly | §3.9. Never send an unresolved model; an unresolved model is an unpredictable cost. |
+| D9 | Separate per-role defaults: `reviewModel` and `taskModel` | §3.10. Review is bounded and read-only; rescue is long-running and write-capable. A 27x spread makes one shared default the wrong economics. |
+| D10 | Show cost on every launch; confirm above a configurable multiplier threshold | §3.10. The multiplier is known before the run, so a 9x background job should never fire by accident. |
+
+D7 through D10 are the intentional departures from strict parity, approved
+explicitly. Everything else mirrors the reference plugin.
 
 ## 5. Repository layout
 
@@ -188,6 +253,7 @@ plugins/copilot/
     lib/
       rpc-client.mjs
       copilot.mjs
+      models.mjs
       args.mjs
       fs.mjs
       git.mjs
@@ -257,8 +323,8 @@ The harness layer. Exports:
   sessionId,          // resume this session, or omit to create a new one
   prompt,
   defaultPrompt,      // used when resuming with no explicit prompt
-  model,              // null = Copilot default
-  effort,             // low | medium | high | xhigh | max
+  model,              // already resolved by lib/models.mjs; never null
+  effort,             // already validated against the model; omitted if unsupported
   readOnly,           // true for reviews, false for rescue
   sessionName,        // set via session.name.set when creating
   agent,              // custom agent name, passed to session.create
@@ -277,7 +343,7 @@ It returns:
   reasoningSummary,
   touchedFiles,
   commandExecutions,
-  usage,              // { premiumRequests, ... } from session.shutdown
+  usage,              // { premiumRequests, aiu, model, multiplier }
   error,
   stderr
 }
@@ -340,7 +406,7 @@ message has been seen and no tool call is outstanding.
 | `lib/state.mjs` | None. Workspace-hashed state dir under `$CLAUDE_PLUGIN_DATA/state`, 50-job cap, job files and log files. |
 | `lib/tracked-jobs.mjs` | Extended with usage accounting (§6.7). Otherwise unchanged. |
 | `lib/job-control.mjs` | Rename `threadId` → `sessionId`. |
-| `lib/render.mjs` | Rename Codex → Copilot in labels; add the usage line. |
+| `lib/render.mjs` | Rename Codex → Copilot in labels; add the cost and usage lines. |
 | `lib/args.mjs`, `lib/process.mjs`, `lib/fs.mjs`, `lib/prompts.mjs`, `lib/workspace.mjs` | None. |
 
 `lib/broker-endpoint.mjs`, `lib/broker-lifecycle.mjs`, `scripts/app-server-broker.mjs`,
@@ -363,17 +429,72 @@ worker has not yet produced its first progress event.
 
 ### 6.7 Premium-request accounting
 
-`usage.mjs` accumulates counters from `assistant.usage` events and from the
+`usage.mjs` owns cost reporting, which is two-sided: predicted before the run,
+actual after it.
+
+**Predicted.** The resolved model's multiplier is rendered on every launch line
+for both foreground and background runs:
+
+```
+model  claude-sonnet-4.6 (9x premium)
+scope  branch diff against main, 14 files
+```
+
+**Threshold confirmation.** `config.costWarnThreshold` defaults to `6`. When a
+resolved multiplier meets or exceeds it, a background launch adds one
+`AskUserQuestion` step offering: proceed, switch to the cheapest model in the
+cached roster, or cancel. Set the threshold to `0` to disable the check
+entirely. Foreground runs show the cost but never add a confirmation step —
+the user is already waiting and can interrupt.
+
+**Actual.** Counters accumulate from `assistant.usage` and from the
 `session.shutdown` event's `totalPremiumRequests` / `totalNanoAiu`.
 
-- Each job record gains `usage: { premiumRequests, aiu, model }`
+- Each job record gains `usage: { premiumRequests, aiu, model, multiplier }`
 - `/copilot:status` renders a `premium` column in its job table
 - `/copilot:status` with no argument renders a session total across listed jobs
 - `/copilot:result` includes the job's usage line
 - When the runtime reports no usage data, the field is omitted rather than
   rendered as zero
 
-This is the one intentional departure from strict parity, approved explicitly.
+### 6.8 Model and effort resolution
+
+`lib/models.mjs` owns resolution. It is the only place a model or effort value
+is decided.
+
+**Resolution chain**, highest wins, evaluated once per command:
+
+```
+1. --model / --effort flag on the command
+2. plugin workspace config   state.json → config.reviewModel | config.taskModel | config.effort
+3. COPILOT_MODEL environment variable
+4. .github/copilot/settings.json   repo pin, read by the plugin
+5. ~/.copilot/settings.json        user default, read by the plugin (§3.9: RPC ignores it)
+6. "auto"                          fallback; carries a 10% discount
+```
+
+The resolved value is always passed to `session.create`. The plugin never sends
+`model: undefined`.
+
+**Model roster cache.** `/copilot:setup` calls `models.list` and caches
+`{ id, multiplier, reasoningEfforts[], premium }` per model into `state.json`
+under `config.modelCatalog`, with a `cachedAt` timestamp. Resolution reads the
+cache; a cache older than 7 days, or a `--model` naming an id absent from the
+cache, triggers a refresh. Nothing about the roster is hardcoded — §3.10's table
+is a measurement, not a constant.
+
+**Effort validation.** After the model resolves, the requested effort is checked
+against that model's `reasoningEfforts`:
+
+- Supported → passed through as `reasoningEffort`
+- Unsupported value → error naming the model and its actual allowed list
+- Model supports no effort at all → the parameter is omitted entirely, and an
+  explicitly requested effort is an error rather than a silent drop
+
+**Role mapping.** `review` and `adversarial-review` resolve `reviewModel`.
+`rescue`, `task`, and the stop-review gate resolve `taskModel`.
+`/copilot:setup --model <id>` sets both; `--review-model` and `--task-model` set
+one each.
 
 ## 7. Commands
 
@@ -395,17 +516,18 @@ they are what make the reference plugin behave well:
 
 ### 7.1 `/copilot:review`
 
-`[--wait|--background] [--base <ref>] [--scope auto|working-tree|branch]`
+`[--wait|--background] [--base <ref>] [--scope auto|working-tree|branch] [--model <id>] [--effort <level>]`
 
 Runs the standards-and-defects review prompt against the resolved git target.
-Read-only per §6.3. Because there is no native reviewer to defer to, this
-command accepts the same target selection as the adversarial variant but still
-rejects custom focus text, preserving the reference plugin's division of labour:
-`review` is not steerable, `adversarial-review` is.
+Read-only per §6.3. Resolves `reviewModel` per §6.8. Because there is no native
+reviewer to defer to, this command accepts the same target selection as the
+adversarial variant but still rejects custom focus text, preserving the
+reference plugin's division of labour: `review` is not steerable,
+`adversarial-review` is.
 
 ### 7.2 `/copilot:adversarial-review`
 
-`[--wait|--background] [--base <ref>] [--scope auto|working-tree|branch] [focus ...]`
+`[--wait|--background] [--base <ref>] [--scope auto|working-tree|branch] [--model <id>] [--effort <level>] [focus ...]`
 
 Ports `prompts/adversarial-review.md` from the reference plugin. That template
 is harness-neutral and is reproduced with only the role line changed and the
@@ -413,16 +535,18 @@ JSON schema inlined per D5.
 
 ### 7.3 `/copilot:rescue`
 
-`[--background|--wait] [--resume|--fresh] [--model <model>] [--effort <level>] [task ...]`
+`[--background|--wait] [--resume|--fresh] [--model <id>] [--effort <level>] [task ...]`
 
-Routes to the `copilot:copilot-rescue` subagent via the `Agent` tool. Write-capable
-by default. Before starting, unless `--resume` or `--fresh` is present, calls
-`copilot-companion.mjs task-resume-candidate --json` and asks once whether to
-continue the latest session for this repo.
+Routes to the `copilot:copilot-rescue` subagent via the `Agent` tool.
+Write-capable by default. Resolves `taskModel` per §6.8. Before starting, unless
+`--resume` or `--fresh` is present, calls `copilot-companion.mjs
+task-resume-candidate --json` and asks once whether to continue the latest
+session for this repo.
 
-Model aliases resolve through a map seeded from `models.list` at setup time
-rather than hardcoded, so the plugin does not go stale as GitHub's roster
-changes. `auto` is passed through untouched.
+`--effort` is validated against the resolved model's supported set per §6.8;
+there is no fixed effort enum. `/copilot:setup` shows the effort levels each
+model accepts. Model ids come from the cached roster, so there is no alias map
+to go stale; `auto` is passed through untouched.
 
 ### 7.4 `/copilot:transfer`
 
@@ -446,18 +570,38 @@ history, and that Copilot has no session-import API.
 ### 7.5 `/copilot:status`, `/copilot:result`, `/copilot:cancel`
 
 Ported behaviour. `status` renders a compact Markdown table for the no-argument
-case and full detail for a specific job ID, now including the premium column.
-`cancel` calls `session.interruptMainTurn`, then terminates the worker process
-tree, then marks the job cancelled.
+case and full detail for a specific job ID, including the premium column and a
+session total. `cancel` calls `session.interruptMainTurn`, then terminates the
+worker process tree, then marks the job cancelled.
 
 ### 7.6 `/copilot:setup`
 
-`[--enable-review-gate|--disable-review-gate]`
+```
+[--model <id>] [--review-model <id>] [--task-model <id>]
+[--effort <level>] [--cost-warn-threshold <n>]
+[--enable-review-gate|--disable-review-gate]
+```
 
-Reports Node, Copilot binary, protocol handshake, and auth status; caches the
-model roster from `models.list`; toggles the review gate. When Copilot is
-missing and npm is available, offers `npm install -g @github/copilot`. When
-Copilot is present but unauthenticated, directs the user to `!copilot login`.
+Reports Node, Copilot binary, protocol handshake, and auth status; refreshes
+`config.modelCatalog` from `models.list`; toggles the review gate.
+
+With no arguments, setup additionally renders the resolved model configuration
+and the reason for each value:
+
+```
+review  claude-sonnet-4.6  9x     from plugin config
+rescue  gpt-5.3-codex      6x     from plugin config
+effort  high                      from plugin config
+warn    at 6x
+```
+
+`--model` with no value opens an `AskUserQuestion` picker built from the live
+`models.list`, each option labelled with its multiplier and supported effort
+levels.
+
+When Copilot is missing and npm is available, offers `npm install -g
+@github/copilot`. When Copilot is present but unauthenticated, directs the user
+to `!copilot login`.
 
 ## 8. Subagent
 
@@ -470,7 +614,8 @@ subagent's constraints:
 - Never calls `review`, `adversarial-review`, `status`, `result`, or `cancel`
 - Returns the companion's stdout verbatim; returns nothing if the call fails
 - May use the `copilot-prompting` skill only to tighten the forwarded prompt
-- Leaves `--model` and `--effort` unset unless the user asked for them
+- Leaves `--model` and `--effort` unset unless the user asked for them, so
+  resolution falls through to §6.8
 - Defaults to `--write` unless the user asked for read-only
 
 ## 9. Skills
@@ -507,9 +652,9 @@ a failure and blocks with an explanation. The gate only reviews the immediately
 previous turn, and only if that turn made direct edits.
 
 The reference plugin's warning is strengthened for Copilot. Each gate firing is
-a billable premium request. The `/copilot:setup` output and the plugin README
-both state this, and the gate's own log line reports the premium requests it
-consumed.
+a billable premium request at the resolved `taskModel`'s multiplier. The
+`/copilot:setup` output and the plugin README both state this, and the gate's
+own log line reports the premium requests it consumed.
 
 ## 11. Prompts and schema
 
@@ -538,12 +683,17 @@ reference plugin.
   `Content-Length` framing, answers `connect`, `auth.getStatus`, `models.list`,
   `session.create`, `session.send`, `session.destroy`, and emits a scripted
   `session.event` sequence including `assistant.usage` and `session.shutdown`.
+  Its `models.list` roster carries mixed multipliers and mixed effort support.
   This is what makes the suite hermetic and free of premium-request cost.
 - `rpc-client.test.mjs` — framing round-trip, split-chunk reads, multiple
   messages in one chunk, request/response correlation, child-exit rejection.
 - `copilot.test.mjs` — turn capture against scripted event sequences, including
   out-of-order notifications and a missing `assistant.turn_end`.
-- `usage.test.mjs` — premium-request accumulation and the omit-when-absent rule.
+- `models.test.mjs` — resolution precedence across all six chain levels, effort
+  validation against a model that supports none, unknown-id cache refresh,
+  threshold boundary behaviour at exactly the configured value.
+- `usage.test.mjs` — premium accumulation, multiplier prediction, and the
+  omit-when-absent rule.
 - `git.test.mjs`, `state.test.mjs`, `render.test.mjs`, `process.test.mjs`,
   `commands.test.mjs` — ported from the reference suite.
 
@@ -552,14 +702,15 @@ CI runs on pull request: `node --test`, plus a version-consistency check across
 
 ## 13. Build order
 
-1. `rpc-client.mjs`, `copilot.mjs`, `/copilot:setup` — end-to-end provable with
-   a real `session.send`
+1. `rpc-client.mjs`, `copilot.mjs`, `models.mjs` with the roster cache, and
+   `/copilot:setup` — end-to-end provable with a real `session.send`. Resolution
+   lands first because every later phase depends on it.
 2. Port `git.mjs`, `state.mjs`, `tracked-jobs.mjs`, `job-control.mjs`,
    `render.mjs`; wire `/copilot:review`
 3. `/copilot:adversarial-review`, `/copilot:rescue`, the subagent, the three
    skills
-4. `/copilot:status`, `/copilot:result`, `/copilot:cancel`, usage accounting,
-   the three hooks, `/copilot:transfer`
+4. `/copilot:status`, `/copilot:result`, `/copilot:cancel`, usage accounting and
+   cost prediction, the three hooks, `/copilot:transfer`
 5. Fake-copilot fixture, full test suite, CI, marketplace metadata, README
 
 ## 14. Risks
@@ -570,8 +721,10 @@ CI runs on pull request: `node --test`, plus a version-consistency check across
 | RK2 | Prompt-enforced JSON is weaker than a schema parameter | Defensive parse with a three-state result; the renderer already handles a parse failure by showing raw output. |
 | RK3 | Read-only is assembled from three mechanisms rather than one flag | All three applied together; the permission handler denies by default. Tool names derived from the live runtime, never hardcoded. |
 | RK4 | Transfer is lossy | Stated plainly in command output and README. |
-| RK5 | Premium-request consumption, especially from the review gate | Per-job accounting surfaced in status and result; gate ships off by default with an explicit warning. |
+| RK5 | Premium-request consumption, especially from the review gate | Per-job accounting surfaced in status and result; gate ships off by default with an explicit warning naming the multiplier. |
 | RK6 | Copilot's tool names and event types drift between releases | Fixture-based tests fail loudly; setup probes the live runtime for the tool roster. |
+| RK7 | A model is used that the user did not expect, at up to 56x the cost of the cheapest option | Model always resolved explicitly (D8), multiplier shown on every launch, threshold confirmation on expensive background runs (D10). |
+| RK8 | The model roster changes and the cached catalog goes stale | 7-day TTL, refresh on unknown id, refresh on every `/copilot:setup`. Nothing about the roster is hardcoded. |
 
 ## 15. Out of scope for v1
 
