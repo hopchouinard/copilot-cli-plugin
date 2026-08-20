@@ -314,6 +314,66 @@ test("redactCredentials leaves an ordinary command untouched", () => {
   assert.equal(redactCredentials("npm test -- --coverage"), "npm test -- --coverage");
 });
 
+test("redactCredentials redacts the bare keyword names, not just prefixed ones", () => {
+  // Regression guard: the assignment regex used to require at least one
+  // identifier character before the keyword, so "TOKEN=x" / "KEY=x" /
+  // "PASSWORD=x" / "CREDENTIAL=x" (the exact bare names the requirement
+  // lists first, and everyday shell/CI idioms on their own) passed through
+  // unredacted while only prefixed names like "GITHUB_TOKEN=x" worked.
+  for (const name of ["TOKEN", "KEY", "PASSWORD", "CREDENTIAL"]) {
+    const redacted = redactCredentials(`${name}=realsecretvalue`);
+    assert.doesNotMatch(redacted, /realsecretvalue/, `${name} leaked its value`);
+    assert.match(redacted, new RegExp(`${name}=<redacted>`), `${name} was not redacted at all`);
+  }
+});
+
+test("redactCredentials fully redacts a quoted value that contains spaces, never leaving the marker beside the live secret", () => {
+  // Regression guard: the optional-quote value pattern couldn't span a
+  // space inside quotes, so it backtracked to a zero-width match right
+  // after "=" and inserted the marker there — producing
+  // `MY_TOKEN=<redacted>"abc def ghi"`, which reads as redacted while the
+  // real secret sits untouched immediately next to the word "redacted".
+  // Absent redaction is honest; that output is actively misleading.
+  const redacted = redactCredentials('MY_TOKEN="abc def ghi" some-cmd');
+  assert.equal(redacted, 'MY_TOKEN="<redacted>" some-cmd');
+  assert.doesNotMatch(redacted, /abc def ghi/);
+});
+
+test("redactCredentials never emits <redacted> directly adjacent to the real secret, across a corpus of realistic command shapes", () => {
+  // The invariant that stops this class of bug returning: for every shape
+  // this function claims to handle, the marker must never sit immediately
+  // next to (nor anywhere ahead of) the plaintext it was supposed to
+  // replace. Shapes this function does NOT claim to handle — single-quoted
+  // escaping edge cases, bare positional tokens, URL-embedded credentials —
+  // are deliberately out of this corpus; those stay honestly unredacted,
+  // which the disclaimer covers, and are not this test's concern.
+  const corpus = [
+    { command: "export GITHUB_TOKEN=ghp_realsecret123", secret: "ghp_realsecret123" },
+    { command: "export TOKEN=ghp_realsecret123", secret: "ghp_realsecret123" },
+    { command: "KEY=abc123 deploy.sh", secret: "abc123" },
+    { command: 'PASSWORD="correct horse battery"', secret: "correct horse battery" },
+    { command: 'MY_TOKEN="abc def ghi" some-cmd', secret: "abc def ghi" },
+    { command: "SECRET='multi word phrase' next-thing", secret: "multi word phrase" },
+    { command: "CREDENTIAL=supersecretvalue --flag", secret: "supersecretvalue" },
+    { command: 'curl -H "Authorization: Bearer sk-live-abc123XYZ"', secret: "sk-live-abc123XYZ" },
+    { command: "echo Bearer sk-live-abc123XYZ", secret: "sk-live-abc123XYZ" },
+    { command: "API_KEY=xyz789 --deploy", secret: "xyz789" }
+  ];
+
+  const escapeRegExp = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+  for (const { command, secret } of corpus) {
+    const redacted = redactCredentials(command);
+    const escapedSecret = escapeRegExp(secret);
+    assert.doesNotMatch(redacted, new RegExp(escapedSecret), `secret leaked verbatim in: ${redacted}`);
+    assert.doesNotMatch(
+      redacted,
+      new RegExp(`<redacted>["']?${escapedSecret}|${escapedSecret}["']?<redacted>`),
+      `"<redacted>" sat directly next to the real secret in: ${redacted}`
+    );
+  }
+});
+
 test("the digest redacts credential-shaped commands before they reach the markdown", () => {
   const file = transcript([
     { type: "user", message: { role: "user", content: "go" } },

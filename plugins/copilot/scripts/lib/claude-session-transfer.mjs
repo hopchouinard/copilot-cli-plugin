@@ -131,9 +131,24 @@ export function redactCredentials(command) {
 
   // NAME=value / NAME="value" assignments where NAME looks secret-ish —
   // keeps the assignment shape (name, quoting) but drops the value.
+  //
+  // The name's prefix is OPTIONAL: TOKEN, KEY, SECRET, PASSWORD, and
+  // CREDENTIAL are exactly the bare names the requirement calls out, and
+  // they are everyday shell/CI idioms on their own (`TOKEN=$X`,
+  // `KEY=... deploy.sh`) — a mandatory prefix character would make the
+  // named case simply not match.
+  //
+  // The value is captured as ONE alternation with two fully-bounded
+  // branches — quoted (spanning spaces via a not-the-closing-quote loop) or
+  // unquoted (up to the next space/quote) — rather than an optional-quote
+  // character class. That avoids the failure mode where a quoted value
+  // containing a space can't be spanned, the quote match backtracks to
+  // zero width, and the marker gets inserted right before the untouched
+  // secret: never emit `<redacted>` immediately followed by text from the
+  // same assignment.
   redacted = redacted.replace(
-    /\b([A-Za-z_][A-Za-z0-9_]*(?:TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL)[A-Za-z0-9_]*)(\s*=\s*)(["']?)[^\s"']*\3/gi,
-    (_match, name, eq, quote) => `${name}${eq}${quote}<redacted>${quote}`
+    /\b((?:[A-Za-z_][A-Za-z0-9_]*)?(?:TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL)[A-Za-z0-9_]*)(\s*=\s*)(?:(["'])((?:(?!\3).)*)\3|[^\s"']*)/gi,
+    (_match, name, eq, quote) => (quote ? `${name}${eq}${quote}<redacted>${quote}` : `${name}${eq}<redacted>`)
   );
 
   return redacted;
