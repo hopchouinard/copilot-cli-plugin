@@ -12,7 +12,13 @@ import { isCatalogStale, normalizeCatalog, catalogHasModel } from "../plugins/co
 import { isAllowedReadOnlyCommand, findLatestTaskSession } from "../plugins/copilot/scripts/lib/copilot.mjs";
 import { renderReviewResult, describeReviewShape } from "../plugins/copilot/scripts/lib/render.mjs";
 import { detectDefaultBranch, collectReviewContext, resolveReviewTarget } from "../plugins/copilot/scripts/lib/git.mjs";
-import { listJobs, setConfig, resolveStateFile } from "../plugins/copilot/scripts/lib/state.mjs";
+import {
+  listJobs,
+  setConfig,
+  resolveStateFile,
+  resolveStateDir,
+  withStateLock
+} from "../plugins/copilot/scripts/lib/state.mjs";
 import { buildCostCheck, buildSetupReport } from "../plugins/copilot/scripts/copilot-companion.mjs";
 import { run, makeTempDir, initGitRepo } from "./helpers.mjs";
 
@@ -580,4 +586,85 @@ test("a message emitted while a command is already running does not arm the fall
   });
 
   assert.equal(result.finalMessage, "THE ACTUAL REVIEW");
+});
+
+// ---------------------------------------------------------------------------
+// Second review round — Copilot reviewer: a writer that timed out waiting for
+// the lock still ran the unconditional release, deleting the real holder's
+// lock directory and letting a third process run concurrently with it.
+// ---------------------------------------------------------------------------
+
+function lockPathFor(cwd) {
+  return path.join(resolveStateDir(cwd), ".state.lock");
+}
+
+function takeForeignLock(cwd, token = "someone-else") {
+  const lockPath = lockPathFor(cwd);
+  fs.mkdirSync(lockPath, { recursive: true });
+  fs.writeFileSync(path.join(lockPath, "owner"), token, "utf8");
+  return lockPath;
+}
+
+test("a writer that times out waiting does not release the real holder's lock", () => {
+  const cwd = tempWorkspace();
+  setConfig(cwd, "reviewModel", "claude-haiku-4.5");
+  const lockPath = takeForeignLock(cwd);
+
+  let ran = false;
+  // Short timeout so this does not sit for the real 10s ceiling.
+  withStateLock(cwd, () => {
+    ran = true;
+  }, { timeoutMs: 60 });
+
+  assert.equal(ran, true, "a timed-out writer must still do its work rather than drop it");
+  assert.equal(fs.existsSync(lockPath), true, "the real holder's lock must survive");
+  assert.equal(fs.readFileSync(path.join(lockPath, "owner"), "utf8"), "someone-else");
+});
+
+test("a holder whose lock was broken as stale does not release its successor's lock", () => {
+  const cwd = tempWorkspace();
+  setConfig(cwd, "reviewModel", "claude-haiku-4.5");
+  const lockPath = lockPathFor(cwd);
+
+  withStateLock(cwd, () => {
+    // Simulate this holder overrunning LOCK_STALE_MS: another process breaks
+    // the lock and takes it while we are still inside the critical section.
+    fs.rmSync(lockPath, { recursive: true, force: true });
+    takeForeignLock(cwd, "successor");
+  });
+
+  assert.equal(fs.existsSync(lockPath), true, "the successor's lock must survive");
+  assert.equal(fs.readFileSync(path.join(lockPath, "owner"), "utf8"), "successor");
+});
+
+test("an uncontended writer takes and releases the lock cleanly", () => {
+  const cwd = tempWorkspace();
+  setConfig(cwd, "reviewModel", "claude-haiku-4.5");
+  const lockPath = lockPathFor(cwd);
+
+  let heldDuring = null;
+  withStateLock(cwd, () => {
+    heldDuring = fs.existsSync(lockPath);
+  });
+
+  assert.equal(heldDuring, true, "the lock must actually be held inside the critical section");
+  assert.equal(fs.existsSync(lockPath), false, "and released afterwards");
+});
+
+test("a stale lock is broken despite carrying its holder's owner file", () => {
+  const cwd = tempWorkspace();
+  setConfig(cwd, "reviewModel", "claude-haiku-4.5");
+  const lockPath = takeForeignLock(cwd, "dead-process");
+  // Backdate well past LOCK_STALE_MS (30s).
+  const longAgo = new Date(Date.now() - 120_000);
+  fs.utimesSync(lockPath, longAgo, longAgo);
+
+  let ran = false;
+  withStateLock(cwd, () => {
+    ran = true;
+    assert.equal(fs.readFileSync(path.join(lockPath, "owner"), "utf8").startsWith(`${process.pid}-`), true);
+  }, { timeoutMs: 60 });
+
+  assert.equal(ran, true);
+  assert.equal(fs.existsSync(lockPath), false, "we owned it, so we released it");
 });

@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -61,11 +61,33 @@ function sleepSync(ms) {
 // immediate self-deadlock.
 let lockDepth = 0;
 
-function acquireLock(lockPath, deadline) {
+// Every acquisition stamps a unique token inside the lock directory, and a
+// release removes the directory ONLY when that token is still its own. Two
+// separate paths reach a release that does not own the lock:
+//
+//   1. acquireLock times out and proceeds unlocked (see below). An
+//      unconditional release then deletes the directory the REAL holder is
+//      standing on, letting a third process acquire and run its
+//      read-modify-write concurrently with it — actively breaking the mutual
+//      exclusion this lock exists to provide, which is strictly worse than
+//      not having taken it.
+//   2. A holder that overruns LOCK_STALE_MS has its lock broken and taken by
+//      someone else; when it finally finishes, an unconditional release
+//      deletes the NEW holder's lock. Same failure, opposite direction.
+//
+// The token closes both. A tiny window remains between reading the token and
+// removing the directory; it is not zero, and this is a state file for a
+// developer tool rather than a distributed transaction log.
+function lockOwnerFile(lockPath) {
+  return path.join(lockPath, "owner");
+}
+
+function acquireLock(lockPath, deadline, token) {
   for (;;) {
     try {
       fs.mkdirSync(lockPath);
-      return;
+      fs.writeFileSync(lockOwnerFile(lockPath), token, "utf8");
+      return true;
     } catch (error) {
       if (error.code !== "EEXIST") {
         throw error;
@@ -79,25 +101,52 @@ function acquireLock(lockPath, deadline) {
       }
       if (Date.now() - heldSince > LOCK_STALE_MS) {
         try {
-          fs.rmdirSync(lockPath);
+          // Recursive: the directory carries its holder's owner file, so a
+          // plain rmdir would fail with ENOTEMPTY and never break the lock.
+          fs.rmSync(lockPath, { recursive: true, force: true });
         } catch {
           // Someone else broke the same stale lock first; retry.
         }
         continue;
       }
       if (Date.now() > deadline) {
-        // Timing out must not abandon the caller's write. Proceeding without
-        // the lock restores exactly the pre-lock behaviour (atomic publish,
-        // unserialized RMW) rather than throwing away a completed paid turn's
-        // bookkeeping.
-        return;
+        // Report the failure rather than pretending to hold the lock. The
+        // caller still proceeds — abandoning the write would throw away a
+        // completed paid turn's bookkeeping — but it must not release a lock
+        // it never took.
+        return false;
       }
       sleepSync(LOCK_RETRY_MS);
     }
   }
 }
 
-export function withStateLock(cwd, fn) {
+function releaseLock(lockPath, token) {
+  let owner;
+  try {
+    owner = fs.readFileSync(lockOwnerFile(lockPath), "utf8");
+  } catch {
+    // Already gone, or broken as stale by another process. Nothing of ours
+    // is left to release, and the directory that may exist now belongs to
+    // whoever took it after us.
+    return;
+  }
+  if (owner !== token) {
+    return;
+  }
+  try {
+    fs.unlinkSync(lockOwnerFile(lockPath));
+  } catch {
+    // Raced with a stale break; the rmdir below will no-op.
+  }
+  try {
+    fs.rmdirSync(lockPath);
+  } catch {
+    // Non-empty or already removed — either way it is no longer ours.
+  }
+}
+
+export function withStateLock(cwd, fn, options = {}) {
   if (lockDepth > 0) {
     lockDepth += 1;
     try {
@@ -109,16 +158,16 @@ export function withStateLock(cwd, fn) {
 
   ensureStateDir(cwd);
   const lockPath = path.join(resolveStateDir(cwd), LOCK_DIR_NAME);
-  acquireLock(lockPath, Date.now() + LOCK_TIMEOUT_MS);
+  const token = `${process.pid}-${randomUUID()}`;
+  const timeoutMs = Number.isFinite(options.timeoutMs) ? options.timeoutMs : LOCK_TIMEOUT_MS;
+  const owned = acquireLock(lockPath, Date.now() + timeoutMs, token);
   lockDepth = 1;
   try {
     return fn();
   } finally {
     lockDepth = 0;
-    try {
-      fs.rmdirSync(lockPath);
-    } catch {
-      // Already broken as stale by another process; nothing to release.
+    if (owned) {
+      releaseLock(lockPath, token);
     }
   }
 }

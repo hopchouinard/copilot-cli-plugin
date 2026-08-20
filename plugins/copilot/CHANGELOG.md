@@ -22,7 +22,9 @@ Correctness:
   turns from models that narrate before acting.
 - `state.json` is published atomically and its read-modify-write is serialized by an interprocess
   lock; a torn read previously rebuilt the file from an empty default and deleted every tracked
-  job's files.
+  job's files. The lock is released only by the process that holds it, verified by an ownership
+  token — releasing unconditionally let a writer that timed out waiting delete the real holder's
+  lock, which was worse than taking no lock at all.
 - Background jobs are persisted before their worker is spawned, closing a race that could strand a
   job in the queue forever.
 - The cost guard refreshes a stale or incomplete model roster before pricing a run, and treats an
