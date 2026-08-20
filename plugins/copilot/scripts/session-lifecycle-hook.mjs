@@ -3,6 +3,7 @@
 import fs from "node:fs";
 import process from "node:process";
 
+import { TRANSCRIPT_PATH_ENV } from "./lib/claude-session-transfer.mjs";
 import { terminateProcessTree } from "./lib/process.mjs";
 import { loadState, resolveStateFile, saveState } from "./lib/state.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
@@ -13,7 +14,6 @@ import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 // session, used for `copilot --resume=<id>`) — reaping must key off this one.
 export const SESSION_ID_ENV = "COPILOT_COMPANION_SESSION_ID";
 const PLUGIN_DATA_ENV = "CLAUDE_PLUGIN_DATA";
-const TRANSCRIPT_PATH_ENV = "CLAUDE_TRANSCRIPT_PATH";
 
 function readHookInput() {
   const raw = fs.readFileSync(0, "utf8").trim();

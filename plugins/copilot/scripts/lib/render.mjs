@@ -206,6 +206,12 @@ export function renderTransferResult(result, options = {}) {
     "briefing and sent as the opening message of a new Copilot session. Copilot",
     "does not know your prior turns beyond what that briefing describes.",
     "",
+    "The briefing includes commands recorded during this session. Values that",
+    "look like credentials (Authorization headers, Bearer tokens, and",
+    "TOKEN/KEY/SECRET/PASSWORD/CREDENTIAL-named assignments) are redacted before",
+    "sending, on a best-effort basis. This is pattern matching, not a guarantee",
+    "— review the commands yourself if you're not sure they're clean.",
+    "",
     `model  ${describeCost(options.model, options.catalog).label}`
   ];
   const usageLine = formatUsage(result.usage);

@@ -5,7 +5,11 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { buildTranscriptDigest, resolveClaudeSessionPath } from "../plugins/copilot/scripts/lib/claude-session-transfer.mjs";
+import {
+  buildTranscriptDigest,
+  redactCredentials,
+  resolveClaudeSessionPath
+} from "../plugins/copilot/scripts/lib/claude-session-transfer.mjs";
 import { executeTransfer } from "../plugins/copilot/scripts/copilot-companion.mjs";
 import { setConfig } from "../plugins/copilot/scripts/lib/state.mjs";
 
@@ -125,7 +129,68 @@ test("a transcript that lives under ~/.claude/projects resolves cleanly", () => 
   const originalHome = process.env.HOME;
   process.env.HOME = home;
   try {
-    assert.equal(resolveClaudeSessionPath(process.cwd(), { source: file }), file);
+    // Compare against the realpath, not the lexical `file` string: on this
+    // machine os.tmpdir() itself sits behind a symlink (/var -> /private/var
+    // on macOS), so the two can legitimately differ even with no
+    // transfer-specific symlink involved.
+    assert.equal(resolveClaudeSessionPath(process.cwd(), { source: file }), fs.realpathSync(file));
+  } finally {
+    process.env.HOME = originalHome;
+  }
+});
+
+test("a hardlink inside ~/.claude/projects pointing at a file outside it is rejected", () => {
+  // Regression test for a real, reproduced escape: fs.realpathSync only
+  // resolves symlinks. A hardlink is a second directory entry pointing at
+  // the same inode elsewhere on disk, so it passes both the lexical and the
+  // symlink-resolved containment checks unchanged unless nlink is checked
+  // too. This must fail against code that only checks realpath containment.
+  const { home, projectsRoot } = isolatedHome();
+  const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), "copilot-outside-"));
+  const secretFile = path.join(outsideDir, "secret.jsonl");
+  fs.writeFileSync(
+    secretFile,
+    JSON.stringify({ type: "user", message: { role: "user", content: "TOP SECRET KEY MATERIAL" } }),
+    "utf8"
+  );
+
+  const projectDir = path.join(projectsRoot, "proj");
+  fs.mkdirSync(projectDir, { recursive: true });
+  const hardlink = path.join(projectDir, "session.jsonl");
+  fs.linkSync(secretFile, hardlink);
+  assert.ok(fs.lstatSync(hardlink).nlink > 1, "test setup sanity check: expected a real hardlink (nlink > 1)");
+
+  const originalHome = process.env.HOME;
+  process.env.HOME = home;
+  try {
+    assert.throws(() => resolveClaudeSessionPath(process.cwd(), { source: hardlink }), /~\/\.claude\/projects/);
+  } finally {
+    process.env.HOME = originalHome;
+  }
+});
+
+test("a symlink inside ~/.claude/projects pointing to another file inside it resolves to the real target, not the symlink path", () => {
+  // Guards against a check-then-use race: if the function returned the
+  // lexical (symlink) path instead of the resolved real path, a caller's
+  // later readFileSync would re-traverse the symlink fresh — and it could
+  // have been repointed outside the root in between.
+  const { home, projectsRoot } = isolatedHome();
+  const realDir = path.join(projectsRoot, "proj-real");
+  fs.mkdirSync(realDir, { recursive: true });
+  const realFile = path.join(realDir, "real-session.jsonl");
+  fs.writeFileSync(realFile, JSON.stringify({ type: "user", message: { role: "user", content: "go" } }), "utf8");
+
+  const linkDir = path.join(projectsRoot, "proj-link");
+  fs.mkdirSync(linkDir, { recursive: true });
+  const link = path.join(linkDir, "session.jsonl");
+  fs.symlinkSync(realFile, link);
+
+  const originalHome = process.env.HOME;
+  process.env.HOME = home;
+  try {
+    const resolved = resolveClaudeSessionPath(process.cwd(), { source: link });
+    assert.equal(resolved, fs.realpathSync(realFile));
+    assert.notEqual(resolved, link);
   } finally {
     process.env.HOME = originalHome;
   }
@@ -227,6 +292,53 @@ test("the transfer output states plainly that this is a primer, not a full histo
   }
 });
 
+test("redactCredentials drops an Authorization: Bearer value while keeping the shape", () => {
+  const redacted = redactCredentials('curl -H "Authorization: Bearer sk-live-abc123XYZ" https://api.example.com');
+  assert.doesNotMatch(redacted, /sk-live-abc123XYZ/);
+  assert.match(redacted, /Authorization: Bearer <redacted>/);
+});
+
+test("redactCredentials drops a bare Bearer token", () => {
+  const redacted = redactCredentials("echo Bearer sk-live-abc123XYZ");
+  assert.doesNotMatch(redacted, /sk-live-abc123XYZ/);
+  assert.match(redacted, /Bearer <redacted>/);
+});
+
+test("redactCredentials drops a secret-ish named assignment", () => {
+  const redacted = redactCredentials("export GITHUB_TOKEN=ghp_abcdef1234567890");
+  assert.doesNotMatch(redacted, /ghp_abcdef1234567890/);
+  assert.match(redacted, /GITHUB_TOKEN=<redacted>/);
+});
+
+test("redactCredentials leaves an ordinary command untouched", () => {
+  assert.equal(redactCredentials("npm test -- --coverage"), "npm test -- --coverage");
+});
+
+test("the digest redacts credential-shaped commands before they reach the markdown", () => {
+  const file = transcript([
+    { type: "user", message: { role: "user", content: "go" } },
+    {
+      type: "assistant",
+      message: {
+        role: "assistant",
+        content: [
+          { type: "tool_use", name: "Bash", input: { command: 'curl -H "Authorization: Bearer sk-live-abc123XYZ"' } }
+        ]
+      }
+    }
+  ]);
+  const digest = buildTranscriptDigest(file);
+  assert.doesNotMatch(digest.markdown, /sk-live-abc123XYZ/);
+  assert.match(digest.markdown, /Authorization: Bearer <redacted>/);
+});
+
+test("the digest markdown states plainly that command redaction is best-effort, not guaranteed", () => {
+  const file = transcript([{ type: "user", message: { role: "user", content: "go" } }]);
+  const markdown = buildTranscriptDigest(file).markdown;
+  assert.match(markdown, /best-effort/i);
+  assert.match(markdown, /not a guarantee/i);
+});
+
 test("transfer runs read-only (plan mode)", async () => {
   const { home, projectsRoot } = isolatedHome();
   const projectDir = path.join(projectsRoot, "proj");
@@ -242,6 +354,27 @@ test("transfer runs read-only (plan mode)", async () => {
   try {
     const execution = await executeTransfer(cwd, { source, ...withScenario({ finalMessage: "Standing by." }) });
     assert.equal(execution.payload.mode, "plan");
+  } finally {
+    process.env.HOME = originalHome;
+  }
+});
+
+test("the rendered transfer output states plainly that command redaction is best-effort, not guaranteed", async () => {
+  const { home, projectsRoot } = isolatedHome();
+  const projectDir = path.join(projectsRoot, "proj");
+  fs.mkdirSync(projectDir, { recursive: true });
+  const source = path.join(projectDir, "session.jsonl");
+  fs.writeFileSync(source, JSON.stringify({ type: "user", message: { role: "user", content: "Ship the thing" } }), "utf8");
+
+  const cwd = tempWorkspace();
+  setConfig(cwd, "taskModel", "claude-haiku-4.5");
+
+  const originalHome = process.env.HOME;
+  process.env.HOME = home;
+  try {
+    const execution = await executeTransfer(cwd, { source, ...withScenario({ finalMessage: "Standing by." }) });
+    assert.match(execution.rendered, /best-effort/i);
+    assert.match(execution.rendered, /not a guarantee/i);
   } finally {
     process.env.HOME = originalHome;
   }
