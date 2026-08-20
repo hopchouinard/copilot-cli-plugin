@@ -17,7 +17,7 @@ const RAW = {
     {
       id: "claude-sonnet-4.6",
       capabilities: { supports: { reasoning_effort: ["low", "medium", "high", "max"] } },
-      billing: { multiplier: 9 }
+      billing: { is_premium: true, multiplier: 9, restricted_to: ["pro", "pro_plus", "individual_trial", "business", "enterprise", "max"] }
     },
     { id: "claude-haiku-4.5", capabilities: { supports: {} }, billing: { multiplier: 0.33 } },
     {
@@ -36,6 +36,11 @@ test("normalizeCatalog extracts multiplier and effort support", () => {
   const sonnet = CATALOG.models.find((model) => model.id === "claude-sonnet-4.6");
   assert.equal(sonnet.multiplier, 9);
   assert.deepEqual(sonnet.reasoningEfforts, ["low", "medium", "high", "max"]);
+  assert.equal(sonnet.premium, true);
+  const auto = CATALOG.models.find((model) => model.id === "auto");
+  assert.equal(auto.discountPercent, 10);
+  assert.equal(auto.multiplier, null);
+  assert.equal(auto.premium, null);
   const haiku = CATALOG.models.find((model) => model.id === "claude-haiku-4.5");
   assert.deepEqual(haiku.reasoningEfforts, []);
   assert.ok(CATALOG.cachedAt);
@@ -107,6 +112,30 @@ test("user settings are read because the RPC layer ignores them", () => {
 test("falls back to auto when nothing is configured", () => {
   const resolved = resolveModel({ role: "task", config: EMPTY, env: {} });
   assert.deepEqual(resolved, { model: "auto", source: "fallback" });
+});
+
+test("skips empty string in config and falls through to next source", () => {
+  const resolved = resolveModel({
+    role: "review",
+    flagModel: null,
+    config: { reviewModel: "", taskModel: null },
+    env: { COPILOT_MODEL: "gpt-5.3-codex" },
+    repoSettings: { model: "claude-sonnet-4.6" },
+    userSettings: { model: "auto" }
+  });
+  assert.deepEqual(resolved, { model: "gpt-5.3-codex", source: "env" });
+});
+
+test("skips whitespace-only string in env and falls through to repo settings", () => {
+  const resolved = resolveModel({
+    role: "task",
+    flagModel: null,
+    config: EMPTY,
+    env: { COPILOT_MODEL: "   " },
+    repoSettings: { model: "claude-sonnet-4.6" },
+    userSettings: { model: "auto" }
+  });
+  assert.deepEqual(resolved, { model: "claude-sonnet-4.6", source: "repo-settings" });
 });
 
 test("validateEffort passes a supported level through", () => {
