@@ -1,0 +1,1059 @@
+import { randomUUID } from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
+
+import { CopilotRpcClient } from "./rpc-client.mjs";
+import { normalizeCatalog } from "./models.mjs";
+import { binaryAvailable } from "./process.mjs";
+
+export const TASK_SESSION_PREFIX = "Copilot Companion Task";
+export const DEFAULT_CONTINUE_PROMPT =
+  "Continue from the current session state. Pick the next highest-value step and follow through until the task is resolved.";
+
+// Real tool names, discovered by a live, no-prompt probe against Copilot
+// CLI 1.0.80 (session.tools.initializeAndValidate followed by
+// session.tools.getCurrentMetadata on a freshly created session). The full
+// baseline tool set that probe returned was: bash, read_bash, stop_bash,
+// list_bash, view, create, edit, web_fetch, skill, sql, read_agent,
+// list_agents, write_agent, grep, glob, task. Of those, only `create`
+// (writes new files) and `edit` (string-replaces inside existing files)
+// mutate the working tree, so those two are the entire real exclusion list.
+// The previous list — "write", "str_replace_editor", "create_file",
+// "apply_patch" — was fiction: the same probe's session.info events named
+// each of them individually as "Unknown tool name in the tool
+// excludedlist", meaning read-only fencing layer 1 (excludedTools) was
+// silently inert for everything except "edit". `bash` is deliberately kept
+// OFF this list: git.mjs's self-collect path (>DEFAULT_INLINE_DIFF_MAX_FILES
+// files) requires Copilot to inspect the diff itself with git commands, and
+// the permission allowlist below (layer 3) is what actually gates which
+// commands are allowed to run — excluding bash entirely would break
+// self-collect reviews outright rather than sandbox them.
+const READ_ONLY_EXCLUDED_TOOLS = ["create", "edit"];
+const INFERRED_COMPLETION_MS = 250;
+
+// C1 fix: a final backstop against a turn hanging forever with the Copilot
+// process alive but silent — no more events, no exit, no error. The
+// primary bounds on `await capture.promise` are session.idle,
+// scheduleInferredCompletion's message-gated timer, the "error" event
+// above, and the client's exitPromise (raced in runCopilotTurn below); this
+// is the last line of defence when none of those ever fire. 15 minutes is
+// deliberately generous — a real review/task turn can legitimately run
+// long — the point is only that SOME ceiling exists, not that it's tight.
+// Overridable via options.absoluteTimeoutMs so tests can exercise it
+// without actually waiting 15 minutes.
+const DEFAULT_ABSOLUTE_TURN_TIMEOUT_MS = 15 * 60 * 1000;
+const NOT_INSTALLED =
+  "GitHub Copilot CLI is not installed or is too old. Install it with `npm install -g @github/copilot`, then rerun `/copilot:setup`.";
+
+// Matches the server→client request the real Copilot CLI sends when a
+// session was created with `requestPermission: true` and the model wants to
+// run a tool. The exact method name was never documented anywhere this
+// plugin was built from (spec §6.3 names the RPC parameter, not the request
+// it provokes), so this matches broadly on the vocabulary GitHub's other
+// dotted RPC names use for this concept ("permission", "confirm", "approve")
+// rather than a single hardcoded string.
+//
+// CONFIRMED VESTIGIAL as of an instrumented live run against Copilot CLI
+// 1.0.80: the real permission-request mechanism is not a server→client
+// request at all. It's a `session.event` notification of type
+// `permission.requested` (see handlePermissionRequestedEvent below), and the
+// probe counted zero server→client requests across an entire self-collect
+// review turn. This matching/handling is kept only as defensive behaviour —
+// "never leave a server request unanswered" is still correct even though
+// this specific path is not what production traffic actually uses.
+const PERMISSION_REQUEST_METHOD_PATTERN = /permission|confirm|approv/i;
+
+// Spec §6.3 layer 3 calls for "denying anything not on an explicit read
+// allowlist" — not a blanket deny for every read-only permission request.
+// git.mjs's self-collect path (git.mjs:8, >2 files) routes Copilot through
+// exactly this: it is told to inspect the diff itself with read-only git
+// commands, and a blanket deny turns that into a confident, paid review of
+// a bare file list the model never actually read.
+//
+// Recognising the executable is NOT sufficient. A PR review demonstrated
+// that `find . -delete` cleared every earlier check: `find` is an
+// inspection tool, the string carries no shell metacharacters, and the
+// argument tail was never examined. `find . -exec rm -rf {} +` was worse —
+// `+` is not a shell metacharacter, so the old charset test passed it
+// straight through. `git diff --output=FILE`, `find -fprintf`, and
+// `rg --pre=<cmd>` are the same class of hole: a read-only-looking verb
+// whose ARGUMENTS write files or execute programs.
+//
+// So the policy is a whitelist over the risky surface. Every token that
+// begins with `-` must appear in that command's explicit flag list; a token
+// that does not begin with `-` is a path, pattern, or ref and is
+// unrestricted. This is why `--pre` and `-delete` are refused without ever
+// being named: nothing that is not listed can pass. Blocklisting the
+// dangerous flags instead would require knowing all of them, which is the
+// property that just failed.
+//
+// A false deny is cheap — the model is refused one command and can retry
+// with a simpler one. A false approval runs.
+const READ_ONLY_BASE_COMMANDS = new Set(["ls", "cat", "rg", "grep", "find", "head", "tail", "wc"]);
+const READ_ONLY_GIT_SUBCOMMANDS = new Set(["status", "diff", "log", "show", "ls-files"]);
+
+// `short` letters may be bundled (`-la`). `long` names are matched after
+// stripping any `=value`. `numeric` permits the bare `-5` count form.
+// `patterns` covers value-attached short flags such as `-U3` or `-C2`.
+// `primaries` is find(1)'s single-dash word vocabulary, matched exactly.
+const READ_ONLY_FLAG_POLICY = {
+  ls: {
+    short: "aAdFghlprRStU1",
+    long: ["all", "almost-all", "classify", "color", "group-directories-first", "human-readable", "recursive", "reverse", "size", "time"]
+  },
+  cat: {
+    short: "bEnstTv",
+    long: ["number", "number-nonblank", "show-all", "show-ends", "show-tabs", "squeeze-blank"]
+  },
+  head: {
+    short: "cnqv",
+    long: ["bytes", "lines", "quiet", "silent", "verbose"],
+    numeric: true
+  },
+  // No -f/--follow: it never returns, which would hang the turn until the
+  // absolute ceiling instead of answering the review.
+  tail: {
+    short: "cnqv",
+    long: ["bytes", "lines", "quiet", "silent", "verbose"],
+    numeric: true
+  },
+  wc: {
+    short: "clLmw",
+    long: ["bytes", "chars", "lines", "max-line-length", "words"]
+  },
+  grep: {
+    short: "aABcCEeFGhHiIlLmnoPqrRsvwxz",
+    long: ["after-context", "before-context", "binary-files", "byte-offset", "color", "colour", "context", "count", "exclude", "exclude-dir", "extended-regexp", "files-with-matches", "files-without-match", "fixed-strings", "ignore-case", "include", "invert-match", "line-number", "line-regexp", "max-count", "no-filename", "no-messages", "only-matching", "perl-regexp", "quiet", "recursive", "regexp", "text", "with-filename", "word-regexp"],
+    patterns: [/^-[ABCm]\d+$/]
+  },
+  rg: {
+    // No -z/--search-zip and no --pre/--pre-glob: each hands file contents to
+    // an external program of the caller's choosing, which is execution.
+    short: "aABcCeFghHilLmnNopqsStTuvwx",
+    long: ["after-context", "before-context", "block-buffered", "byte-offset", "case-sensitive", "color", "colors", "column", "context", "count", "count-matches", "files", "files-with-matches", "files-without-match", "fixed-strings", "follow", "glob", "heading", "hidden", "iglob", "ignore-case", "invert-match", "json", "line-number", "line-regexp", "max-columns", "max-count", "max-depth", "maxdepth", "multiline", "multiline-dotall", "no-config", "no-filename", "no-heading", "no-ignore", "no-line-number", "no-messages", "null", "only-matching", "regexp", "smart-case", "sort", "sortr", "text", "trim", "type", "type-not", "vimgrep", "with-filename", "word-regexp"],
+    patterns: [/^-[ABCm]\d+$/]
+  },
+  find: {
+    // Tests and traversal control only. Every ACTION primary that writes or
+    // executes is absent by construction: -delete, -exec, -execdir, -ok,
+    // -okdir, -fprint, -fprint0, -fprintf, -fls.
+    short: "",
+    long: [],
+    primaries: ["-name", "-iname", "-path", "-ipath", "-lname", "-ilname", "-regex", "-iregex", "-regextype", "-type", "-xtype", "-maxdepth", "-mindepth", "-depth", "-mount", "-xdev", "-prune", "-quit", "-print", "-print0", "-printf", "-ls", "-newer", "-newermt", "-anewer", "-cnewer", "-size", "-empty", "-not", "-and", "-or", "-a", "-o", "-true", "-false", "-atime", "-ctime", "-mtime", "-amin", "-cmin", "-mmin", "-user", "-group", "-uid", "-gid", "-nouser", "-nogroup", "-perm", "-readable", "-writable", "-executable", "-samefile", "-inum", "-links", "-follow", "-L", "-H", "-P"]
+  },
+  "git status": {
+    short: "bsuvz",
+    long: ["ahead-behind", "branch", "column", "find-renames", "ignored", "long", "no-column", "no-renames", "porcelain", "renames", "short", "untracked-files", "verbose"]
+  },
+  "git diff": {
+    // No --output / --output-indicator-*: those write files. No --ext-diff:
+    // that runs an external diff program.
+    short: "bBcCDlMpRsStUwWz",
+    long: ["binary", "cached", "color", "compact-summary", "diff-filter", "dirstat", "dst-prefix", "find-copies", "find-renames", "function-context", "ignore-all-space", "ignore-blank-lines", "ignore-space-at-eol", "ignore-space-change", "irreversible-delete", "merge-base", "name-only", "name-status", "no-color", "no-ext-diff", "no-patch", "no-prefix", "no-renames", "numstat", "patch", "raw", "relative", "shortstat", "src-prefix", "staged", "stat", "submodule", "summary", "text", "unified", "word-diff", "word-diff-regex"],
+    patterns: [/^-U\d+$/, /^-M\d+$/, /^-C\d+$/]
+  },
+  "git log": {
+    short: "cEGiLnpsSuUz",
+    long: ["abbrev-commit", "after", "all", "author", "before", "cherry-pick", "color", "committer", "date", "date-order", "decorate", "first-parent", "follow", "format", "graph", "grep", "max-count", "merges", "name-only", "name-status", "no-abbrev-commit", "no-color", "no-decorate", "no-merges", "no-patch", "no-renames", "numstat", "oneline", "patch", "pretty", "relative-date", "reverse", "shortstat", "since", "skip", "stat", "topo-order", "unified", "until"],
+    patterns: [/^-\d+$/, /^-n\d+$/, /^-U\d+$/]
+  },
+  "git show": {
+    short: "cmpsUz",
+    long: ["abbrev-commit", "color", "date", "format", "name-only", "name-status", "no-abbrev-commit", "no-color", "no-patch", "numstat", "oneline", "patch", "pretty", "shortstat", "stat", "unified"],
+    patterns: [/^-U\d+$/]
+  },
+  "git ls-files": {
+    short: "cdikmostuz",
+    long: ["cached", "deleted", "directory", "error-unmatch", "exclude-standard", "full-name", "ignored", "modified", "no-empty-directory", "others", "stage", "unmerged"]
+  }
+};
+
+// Characters that could separate, chain, redirect, or otherwise smuggle a
+// second command past an allowlisted-looking prefix (e.g.
+// "git status; rm -rf ." or "git status\nrm -rf /"). This deliberately
+// includes every C0 control character (`\x00`-`\x1f`), not just the
+// obviously shell-special ones: whitespace tokenisation treats a literal
+// newline or carriage return as an ordinary separator, which a live
+// re-review confirmed was exploitable to run an unreviewed second command in
+// read-only mode ("git status\nrm -rf /" was being approved). Any of these
+// forces a deny regardless of the leading command.
+const SHELL_CHAIN_PATTERN = /[\x00-\x1f;&|`<>\\]|\$\(/;
+
+function readOnlyPolicyFor(tokens) {
+  if (tokens[0] === "git") {
+    if (tokens.length < 2 || !READ_ONLY_GIT_SUBCOMMANDS.has(tokens[1])) {
+      return null;
+    }
+    return { policy: READ_ONLY_FLAG_POLICY[`git ${tokens[1]}`], args: tokens.slice(2) };
+  }
+  if (!READ_ONLY_BASE_COMMANDS.has(tokens[0])) {
+    return null;
+  }
+  return { policy: READ_ONLY_FLAG_POLICY[tokens[0]], args: tokens.slice(1) };
+}
+
+function isAllowedFlagToken(token, policy) {
+  // `--` ends option parsing; a lone `-` is the stdin operand.
+  if (token === "--" || token === "-") {
+    return true;
+  }
+
+  if (policy.primaries) {
+    return policy.primaries.includes(token);
+  }
+
+  for (const pattern of policy.patterns ?? []) {
+    if (pattern.test(token)) {
+      return true;
+    }
+  }
+
+  if (token.startsWith("--")) {
+    const name = token.slice(2).split("=")[0];
+    return policy.long.includes(name);
+  }
+
+  if (policy.numeric && /^-\d+$/.test(token)) {
+    return true;
+  }
+
+  // A bundled short-flag run: every letter must be allowed on its own.
+  const letters = token.slice(1);
+  if (!letters || !/^[A-Za-z]+$/.test(letters)) {
+    return false;
+  }
+  return [...letters].every((letter) => policy.short.includes(letter));
+}
+
+// The exact params shape a server permission request carries for a shell/
+// tool command was never confirmed against the real protocol (see the
+// PERMISSION_REQUEST_METHOD_PATTERN comment above), so this probes a small
+// set of plausible field paths rather than assuming one. It returns a
+// command string only when it finds one unambiguously; any shape it doesn't
+// recognise returns null, which callers must treat as "cannot identify the
+// command" — degrading to deny, never to allow.
+function extractRequestedCommand(params) {
+  if (!params || typeof params !== "object") {
+    return null;
+  }
+  const candidates = [
+    params.command,
+    params.input?.command,
+    params.arguments?.command,
+    params.toolCall?.arguments?.command,
+    params.tool?.input?.command,
+    params.parameters?.command
+  ];
+  for (const candidate of candidates) {
+    if (typeof candidate === "string" && candidate.trim()) {
+      return candidate.trim();
+    }
+    if (Array.isArray(candidate) && candidate.length > 0 && candidate.every((part) => typeof part === "string")) {
+      const joined = candidate.join(" ").trim();
+      if (joined) {
+        return joined;
+      }
+    }
+  }
+  return null;
+}
+
+export function isAllowedReadOnlyCommand(command) {
+  if (typeof command !== "string" || !command.trim()) {
+    return false;
+  }
+  const trimmed = command.trim();
+  if (SHELL_CHAIN_PATTERN.test(trimmed)) {
+    return false;
+  }
+
+  const tokens = trimmed.split(/\s+/);
+  const resolved = readOnlyPolicyFor(tokens);
+  if (!resolved?.policy) {
+    return false;
+  }
+
+  // EVERY token is examined, not just the leading verb. This is what closes
+  // the `find . -delete` class of bypass: the old check proved only that the
+  // command STARTED with an inspection tool, never that the rest of it was
+  // harmless.
+  return resolved.args.every((token) => !token.startsWith("-") || isAllowedFlagToken(token, resolved.policy));
+}
+
+// Answers a server permission request per spec §6.3 layer 3
+// ("deny-by-default permissions... denying anything not on an explicit read
+// allowlist"): a write-capable turn always allows; a read-only turn allows
+// only when the requested command can be confidently identified and matches
+// the read-only allowlist above, and denies otherwise (including when the
+// command can't be identified at all — see extractRequestedCommand). The
+// exact expected reply shape is unconfirmed against the real protocol (see
+// the comment above), so this returns several differently-named
+// boolean/string fields that cover the plausible shapes (`decision`,
+// `approved`, `allow`, `behavior`) — harmless extra keys in a JSON-RPC
+// result are ignored by a spec-conformant server, but a *missing* key the
+// server actually reads would silently misbehave, which this hedges against
+// until a live run confirms the real shape.
+function buildPermissionResponse(readOnly, params) {
+  const allow = !readOnly || isAllowedReadOnlyCommand(extractRequestedCommand(params));
+  return {
+    decision: allow ? "allow" : "deny",
+    approved: allow,
+    allow,
+    behavior: allow ? "allow" : "deny"
+  };
+}
+
+// Registered as the RPC client's server-request handler for the duration of
+// a turn. Every server→client request must get a reply (see rpc-client.mjs);
+// this is the policy for what that reply is. Anything that doesn't look like
+// a permission request is refused explicitly (thrown, which rpc-client.mjs
+// turns into a JSON-RPC error reply) rather than guessed at — an explicit
+// refusal surfaces as a loud failure the server can act on, instead of a
+// silently wrong answer.
+function createServerRequestHandler({ readOnly, onProgress }) {
+  return (message) => {
+    const { method, params } = message;
+    emit(onProgress, `Server request: ${method}`, "investigating", {
+      logTitle: "Server request",
+      logBody: JSON.stringify(params ?? {}, null, 2)
+    });
+
+    if (!PERMISSION_REQUEST_METHOD_PATTERN.test(String(method ?? ""))) {
+      throw new Error(`Unsupported server request: ${method}`);
+    }
+
+    return buildPermissionResponse(readOnly, params);
+  };
+}
+
+// The actual permission mechanism, confirmed by an instrumented live run
+// against Copilot CLI 1.0.80: the server signals a pending tool-permission
+// decision via a `session.event` notification —
+//   { type: "permission.requested",
+//     data: { requestId, permissionRequest: { kind: "shell", fullCommandText, intention, ... } } }
+// — and expects the client to resolve it by calling
+// `session.permissions.handlePendingPermissionRequest`. That probe counted
+// zero server→client JSON-RPC requests across the whole turn, so
+// createServerRequestHandler/PERMISSION_REQUEST_METHOD_PATTERN above never
+// actually fire for permissions in production; this is the real path.
+//
+// Spec §6.3 layer 3's "deny-by-default... denying anything not on an
+// explicit read allowlist" now has much better input to work with than the
+// params-shape guessing above: `permissionRequest.kind` is the literal
+// string "shell" and `fullCommandText` is the literal command, so the
+// allowlist matches directly against it instead of probing candidate field
+// paths. Non-shell permission kinds (write, mcp, url, memory, ...) have no
+// allowlist and are denied outright under a read-only posture.
+//
+// A write-capable turn already calls session.permissions.setAllowAll before
+// sending the prompt, and the confirmed live run showed a write-capable
+// rescue completing in 5.7s with none of this event handling in place —
+// i.e. setAllowAll suppresses the need for a per-request decision entirely.
+// So a write-capable turn approves unconditionally here rather than
+// re-deriving a decision setAllowAll has already made moot.
+function decidePermission(readOnly, permissionRequest) {
+  if (!readOnly) {
+    return { kind: "approve-once" };
+  }
+  if (permissionRequest?.kind === "shell" && isAllowedReadOnlyCommand(permissionRequest.fullCommandText)) {
+    return { kind: "approve-once" };
+  }
+  return {
+    kind: "reject",
+    feedback: "Denied by read-only review policy: command is not on the read-only inspection allowlist."
+  };
+}
+
+// Answers one `permission.requested` session event. The `{ sessionId,
+// requestId, result }` params shape and the `{ kind: "approve-once" }` /
+// `{ kind: "reject", feedback }` result variants were confirmed by a live,
+// no-prompt probe against Copilot CLI 1.0.80 (creating a session and
+// calling handlePendingPermissionRequest with a bogus requestId): omitting
+// `sessionId` fails with "Missing sessionId in
+// session.permissions.handlePendingPermissionRequest request"; including it
+// succeeds structurally (`{ success: false }`, since the bogus id matches no
+// pending request). Both result `kind` variants were accepted without error.
+//
+// Never throws: a permission decision that fails to send must not take down
+// the whole turn (which would otherwise convert a request the server IS
+// still waiting on into an unhandled rejection instead of just a stuck,
+// diagnosable turn) — it's reported via onProgress instead.
+async function handlePermissionRequestedEvent(client, sessionId, event, { readOnly, onProgress }) {
+  const requestId = event?.data?.requestId;
+  if (!requestId) {
+    return;
+  }
+  const permissionRequest = event.data.permissionRequest;
+  const decision = decidePermission(readOnly, permissionRequest);
+  const label =
+    permissionRequest?.kind === "shell"
+      ? shorten(permissionRequest.fullCommandText)
+      : String(permissionRequest?.kind ?? "unknown");
+  emit(onProgress, `Permission request (${label}): ${decision.kind}`, "investigating", {
+    logTitle: "Permission request",
+    logBody: JSON.stringify({ requestId, permissionRequest, decision }, null, 2)
+  });
+  try {
+    await client.request("session.permissions.handlePendingPermissionRequest", {
+      sessionId,
+      requestId,
+      result: decision
+    });
+  } catch (error) {
+    emit(
+      onProgress,
+      `Failed to answer permission request ${requestId}: ${error instanceof Error ? error.message : String(error)}`,
+      "failed"
+    );
+  }
+}
+
+function shorten(text, limit = 96) {
+  const normalized = String(text ?? "").trim().replace(/\s+/g, " ");
+  return normalized.length <= limit ? normalized : `${normalized.slice(0, limit - 3)}...`;
+}
+
+function looksLikeVerificationCommand(command) {
+  return /\b(test|tests|lint|build|typecheck|type-check|check|verify|validate|pytest|jest|vitest|cargo test|npm test|pnpm test|yarn test|go test|tsc|eslint|ruff)\b/i.test(
+    String(command ?? "")
+  );
+}
+
+// See the call site in runCopilotTurn for why this exists: `assistant.usage`
+// and `session.shutdown` were both empty against the real Copilot CLI, but
+// `session.usage.getMetrics` returns real numbers when probed live. Failure
+// here (unsupported method, closed client, etc.) must never throw — it is a
+// best-effort supplement to the event-based capture, not a requirement.
+async function fetchUsageMetrics(client, sessionId) {
+  try {
+    return await client.request("session.usage.getMetrics", { sessionId });
+  } catch {
+    return null;
+  }
+}
+
+// `totalPremiumRequestCost` / `totalNanoAiu` take priority over the
+// event-based numbers whenever the metrics call succeeded and returned a
+// number — including 0, a legitimate value for a non-premium model — and
+// fall back to whatever `assistant.usage` events already captured otherwise.
+//
+// Both fields are SESSION totals, not turn costs. Storing them raw as one
+// job's usage double-counted every resumed session: a rescue follow-up that
+// resumes an earlier Copilot session reported that session's whole running
+// total as its own spend, and summariseJobUsage then added the first job's
+// number a second time — 1 followed by 2 rendered as a 3-request session
+// total when only 2 were consumed. Subtracting a baseline sampled before
+// session.send makes the stored figure the delta this turn actually cost.
+function subtractBaseline(total, baseline) {
+  if (typeof total !== "number") {
+    return null;
+  }
+  if (typeof baseline !== "number") {
+    return total;
+  }
+  // Never report a negative cost: if the counters ever move backwards
+  // (a reset, a different accounting basis), fall back to the raw total
+  // rather than inventing a refund.
+  return total >= baseline ? total - baseline : total;
+}
+
+function mergeUsageMetrics(eventUsage, metrics, baseline = null) {
+  if (!metrics) {
+    return eventUsage;
+  }
+  const premium = subtractBaseline(metrics.totalPremiumRequestCost, baseline?.totalPremiumRequestCost);
+  const nanoAiu = subtractBaseline(metrics.totalNanoAiu, baseline?.totalNanoAiu);
+  return {
+    ...eventUsage,
+    premiumRequests: premium ?? eventUsage.premiumRequests,
+    aiu: nanoAiu ?? eventUsage.aiu
+  };
+}
+
+// `codeChanges.filesModified` on session.usage.getMetrics is likely a more
+// complete touched-files source than the `file.changed` event tracking, but
+// its non-empty shape was never observed live (only an empty array was
+// probed). Only prefer it when it is unambiguously a non-empty array of
+// path strings — render.mjs interpolates each entry directly into a
+// Markdown line, so anything else silently produces "- [object Object]".
+// Otherwise keep the event-based list; this is a supplement, not a forced
+// replacement.
+function preferMetricsTouchedFiles(eventFiles, metrics) {
+  const filesModified = metrics?.codeChanges?.filesModified;
+  if (
+    Array.isArray(filesModified) &&
+    filesModified.length > 0 &&
+    filesModified.every((entry) => typeof entry === "string")
+  ) {
+    return filesModified;
+  }
+  return eventFiles;
+}
+
+function emit(onProgress, message, phase = null, extra = {}) {
+  if (!onProgress || !message) {
+    return;
+  }
+  onProgress({ message, phase, ...extra });
+}
+
+async function withClient(cwd, options, fn) {
+  const client = await CopilotRpcClient.connect(cwd, {
+    binary: options.binary,
+    env: options.env
+  });
+  try {
+    return await fn(client);
+  } finally {
+    await client.close().catch(() => {});
+  }
+}
+
+export function getCopilotAvailability(cwd, options = {}) {
+  const binary = options.binary ?? "copilot";
+  const version = binaryAvailable(binary, ["--version"], { cwd });
+  if (!version.available) {
+    return { available: false, detail: version.detail, version: null };
+  }
+  return { available: true, detail: version.detail, version: version.detail };
+}
+
+export async function getCopilotAuthStatus(cwd, options = {}) {
+  try {
+    return await withClient(cwd, options, async (client) => {
+      const status = await client.request("auth.getStatus", {});
+      return {
+        available: true,
+        loggedIn: Boolean(status?.isAuthenticated),
+        detail: status?.statusMessage ?? (status?.isAuthenticated ? "authenticated" : "not authenticated"),
+        authType: status?.authType ?? null,
+        login: status?.login ?? null,
+        host: status?.host ?? null
+      };
+    });
+  } catch (error) {
+    return {
+      available: false,
+      loggedIn: false,
+      detail: error instanceof Error ? error.message : String(error),
+      authType: null,
+      login: null,
+      host: null
+    };
+  }
+}
+
+export async function fetchModelCatalog(cwd, options = {}) {
+  return withClient(cwd, options, async (client) => normalizeCatalog(await client.request("models.list", {})));
+}
+
+function createCapture(sessionId, onProgress) {
+  return {
+    sessionId,
+    onProgress,
+    buffered: [],
+    started: false,
+    finalMessage: "",
+    reasoning: [],
+    touchedFiles: new Set(),
+    commandExecutions: [],
+    // Outstanding tool work. The inferred-completion fallback must not fire
+    // while either is live — see scheduleInferredCompletion.
+    activeCommands: 0,
+    toolCallInFlight: false,
+    usage: { premiumRequests: null, aiu: null },
+    error: null,
+    completed: false,
+    sawMessage: false,
+    timer: null,
+    resolve: null,
+    promise: null
+  };
+}
+
+function scheduleInferredCompletion(capture) {
+  if (capture.completed || !capture.sawMessage) {
+    return;
+  }
+  // A model that narrates before it acts ("Let me check the diff…") emits an
+  // assistant.message and THEN calls a tool. Arming the fallback there meant
+  // any tool call lasting longer than INFERRED_COMPLETION_MS resolved the
+  // capture and closed the RPC client mid-round, truncating the review to
+  // the preamble — after the premium request was already paid for.
+  // session.idle remains the authoritative completion signal; this timer is
+  // only a fallback for builds that never send one, so declining to arm it
+  // while work is outstanding costs nothing on the normal path.
+  if (capture.activeCommands > 0 || capture.toolCallInFlight) {
+    clearTimeout(capture.timer);
+    return;
+  }
+  clearTimeout(capture.timer);
+  capture.timer = setTimeout(() => {
+    if (!capture.completed && capture.sawMessage) {
+      capture.completed = true;
+      capture.resolve();
+    }
+  }, INFERRED_COMPLETION_MS);
+  capture.timer.unref?.();
+}
+
+function applyEvent(capture, event) {
+  const data = event?.data ?? {};
+
+  switch (event?.type) {
+    case "session.start":
+      emit(capture.onProgress, "Session ready.", "starting");
+      break;
+    case "assistant.turn_start":
+      emit(capture.onProgress, "Turn started.", "starting");
+      break;
+    case "assistant.reasoning": {
+      const text = String(data.text ?? data.summary ?? "").trim();
+      if (text) {
+        capture.reasoning.push(text);
+        emit(capture.onProgress, `Reasoning: ${shorten(text)}`, "investigating", {
+          logTitle: "Reasoning summary",
+          logBody: text
+        });
+      }
+      break;
+    }
+    case "command.execute":
+      capture.activeCommands += 1;
+      clearTimeout(capture.timer);
+      emit(
+        capture.onProgress,
+        `Running command: ${shorten(data.command)}`,
+        looksLikeVerificationCommand(data.command) ? "verifying" : "running"
+      );
+      break;
+    case "command.completed":
+      capture.activeCommands = Math.max(0, capture.activeCommands - 1);
+      capture.toolCallInFlight = false;
+      capture.commandExecutions.push(data);
+      emit(
+        capture.onProgress,
+        `Command completed: ${shorten(data.command)} (exit ${data.exitCode ?? "?"})`,
+        looksLikeVerificationCommand(data.command) ? "verifying" : "running"
+      );
+      scheduleInferredCompletion(capture);
+      break;
+    case "assistant.tool_call_delta":
+      capture.toolCallInFlight = true;
+      clearTimeout(capture.timer);
+      emit(capture.onProgress, `Tool call: ${shorten(data.name ?? data.tool)}`, "investigating");
+      break;
+    case "file.changed":
+      if (data.path) {
+        capture.touchedFiles.add(data.path);
+      }
+      break;
+    case "assistant.message": {
+      const content = String(data.content ?? data.text ?? "").trim();
+      if (content) {
+        capture.finalMessage = content;
+        capture.sawMessage = true;
+        emit(capture.onProgress, `Assistant message captured: ${shorten(content)}`, "finalizing", {
+          logTitle: "Assistant message",
+          logBody: content
+        });
+        scheduleInferredCompletion(capture);
+      }
+      break;
+    }
+    case "assistant.usage":
+      if (typeof data.premiumRequests === "number") {
+        capture.usage.premiumRequests = data.premiumRequests;
+      }
+      break;
+    case "assistant.turn_end":
+      // One inference round within a potentially multi-round agentic turn
+      // has ended — NOT necessarily the whole turn. Discovered live against
+      // Copilot 1.0.80 while verifying the permission-event fix (Fix 1):
+      // a self-collect review (git.mjs's self-collect path, >2 files) has
+      // Copilot call a tool (e.g. `git diff`) in round 1, and
+      // assistant.turn_end fires for THAT round the instant the tool call
+      // resolves — before the model has written any actual review content.
+      // Resolving the capture here unconditionally (the pre-existing
+      // behaviour) silently truncated exactly that kind of turn to an empty
+      // result once Fix 1 stopped it from hanging on the unanswered
+      // permission request instead. `session.idle` (below) is the
+      // authoritative "nothing more is coming" signal, so this case is now
+      // progress-logging only. It deliberately leaves any inferred-
+      // completion timer alone (does not clear it): a tool-only round never
+      // carries an assistant.message (confirmed by the same live run —
+      // round 1 of a self-collect review had zero assistant.message events,
+      // only tool calls), so in practice a message only ever appears in the
+      // turn's final round, and scheduleInferredCompletion (unchanged) is
+      // what lets that message's 250ms fallback timer still resolve the
+      // single-round happy path — and any build that never emits
+      // session.idle at all — exactly as it did before this fix.
+      emit(capture.onProgress, "Turn round completed.", "investigating");
+      // The round is over, so whatever tool it was running has resolved —
+      // clear the in-flight marker and re-arm the fallback, which is what
+      // keeps a build that never emits session.idle from hanging until the
+      // absolute ceiling.
+      capture.toolCallInFlight = false;
+      capture.activeCommands = 0;
+      scheduleInferredCompletion(capture);
+      break;
+    case "session.idle":
+      // The authoritative "the whole agentic turn is done" signal — see the
+      // assistant.turn_end comment above. The real Copilot CLI defers this
+      // until all of the turn's work (including multi-round tool use) has
+      // actually finished, unlike assistant.turn_end which fires once per
+      // inference round.
+      clearTimeout(capture.timer);
+      if (!capture.completed) {
+        capture.completed = true;
+        emit(capture.onProgress, "Turn completed.", "finalizing");
+        capture.resolve();
+      }
+      break;
+    case "session.shutdown":
+      if (typeof data.totalPremiumRequests === "number") {
+        capture.usage.premiumRequests = data.totalPremiumRequests;
+      }
+      if (typeof data.totalNanoAiu === "number") {
+        capture.usage.aiu = data.totalNanoAiu;
+      }
+      break;
+    case "error":
+      // C1 fix: an `error` event is a genuine, terminal end to the turn —
+      // no further assistant.message, assistant.turn_end, or session.idle
+      // is coming after it. The pre-existing code recorded capture.error
+      // but never resolved the capture, so a round that produced no
+      // assistant.message (e.g. self-collect's tool-only round 1) followed
+      // by an error hung forever: neither of the two things that can
+      // settle capture.promise (session.idle, or scheduleInferredCompletion's
+      // message-gated timer) would ever fire. Resolve here so the turn
+      // fails loudly (status 1, via capture.error below) instead of
+      // hanging silently.
+      capture.error = data;
+      emit(capture.onProgress, `Copilot error: ${data.message ?? "unknown"}`, "failed");
+      clearTimeout(capture.timer);
+      if (!capture.completed) {
+        capture.completed = true;
+        capture.resolve();
+      }
+      break;
+    case "session.info":
+      // Fix 2 (permission-fix wave): configuration-category session.info
+      // events are exactly what surfaced the fictional excludedTools names
+      // during the live 1.0.80 acceptance run ("Unknown tool name in the
+      // tool excludedlist: ..."). Had these been logged, that would have
+      // been caught on the first live run instead of the twentieth —
+      // surface them into the progress log so the same class of runtime
+      // mismatch is visible immediately in future.
+      if (data.infoType === "configuration" && data.message) {
+        emit(capture.onProgress, `Configuration: ${data.message}`, null, {
+          logTitle: "Session configuration",
+          logBody: data.message
+        });
+      }
+      break;
+    default:
+      break;
+  }
+}
+
+export async function runCopilotTurn(cwd, options = {}) {
+  const availability = getCopilotAvailability(cwd, options);
+  if (!availability.available) {
+    throw new Error(NOT_INSTALLED);
+  }
+
+  if (!options.model) {
+    throw new Error("runCopilotTurn requires an explicitly resolved model.");
+  }
+
+  return withClient(cwd, options, async (client) => {
+    // options.sessionId means "resume this EXISTING session" (session.resume).
+    // options.newSessionId means "create a NEW session using THIS id"
+    // (session.create) — used by background jobs, which mint a Copilot
+    // session id before their worker exists so /copilot:cancel can target
+    // it immediately. The real CLI rejects session.resume for an id it has
+    // never created, so these two must route to different RPC calls.
+    const sessionId = options.sessionId ?? options.newSessionId ?? randomUUID();
+    const resuming = Boolean(options.sessionId);
+
+    const capture = createCapture(sessionId, options.onProgress);
+    capture.promise = new Promise((resolve) => {
+      capture.resolve = resolve;
+    });
+
+    // Tracks in-flight handlePermissionRequestedEvent calls so the turn can
+    // wait for all of them to actually finish (see below, after
+    // capture.promise resolves) before returning — otherwise a permission
+    // reply could still be in flight on the wire when withClient's `finally`
+    // closes the RPC client, dropping the reply and, on a real server that's
+    // still genuinely waiting on it, reintroducing exactly the class of hang
+    // this fix removes.
+    const pendingPermissionReplies = [];
+
+    client.setNotificationHandler((message) => {
+      if (message.method !== "session.event" || message.params?.sessionId !== sessionId) {
+        return;
+      }
+      const event = message.params.event;
+
+      // Fix 1 (permission-fix wave): this is the confirmed real permission
+      // mechanism — see handlePermissionRequestedEvent's comment. It is
+      // dispatched here, ahead of the capture.started buffering gate below,
+      // because the server's turn is blocked on this specific reply right
+      // now; deferring it behind capture bookkeeping (which exists to order
+      // progress reporting, not to gate correctness) would reintroduce the
+      // exact hang this fix removes. handlePermissionRequestedEvent never
+      // throws (failures are reported via onProgress instead), so this can't
+      // produce an unhandled rejection; it's tracked in
+      // pendingPermissionReplies purely so the turn can wait for it later.
+      if (event?.type === "permission.requested") {
+        pendingPermissionReplies.push(
+          handlePermissionRequestedEvent(client, sessionId, event, {
+            readOnly: Boolean(options.readOnly),
+            onProgress: options.onProgress
+          })
+        );
+      }
+
+      if (!capture.started) {
+        capture.buffered.push(event);
+        return;
+      }
+      applyEvent(capture, event);
+    });
+
+    // Spec §6.3 layer 3, vestigial path: with `requestPermission: true`
+    // below, older/other builds may block a tool call on a server→client
+    // request instead of the session.event notification handled above. Keep
+    // answering it — "never leave a server request unanswered" is correct
+    // defensive behaviour even though the confirmed 1.0.80 permission path
+    // is the notification above, not this (see rpc-client.mjs's
+    // handleServerRequest for the transport half of this).
+    client.setServerRequestHandler(createServerRequestHandler({ readOnly: Boolean(options.readOnly), onProgress: options.onProgress }));
+
+    if (resuming) {
+      // Fix M2/M3: emit copilotSessionId alongside the progress message so
+      // it reaches the job record (tracked-jobs.mjs's progress updater only
+      // writes copilotSessionId when a progress event carries one) — without
+      // it, /copilot:cancel's interruptCopilotTurn call is always a no-op
+      // during a running job. Also pass model/reasoningEffort on resume,
+      // mirroring the create branch below: a previous ruling verified
+      // against the real Copilot CLI that session.resume accepts these
+      // extra params without error, and render.mjs prints the resolved
+      // model's multiplier regardless of which branch ran, so omitting them
+      // here silently billed at the resumed session's original model while
+      // printing the multiplier for whatever --model was requested instead.
+      emit(options.onProgress, `Resuming session ${sessionId}.`, "starting", { copilotSessionId: sessionId });
+      await client.request("session.resume", {
+        sessionId,
+        workingDirectory: cwd,
+        model: options.model,
+        ...(options.effort ? { reasoningEffort: options.effort } : {}),
+        ...(options.readOnly ? { excludedTools: READ_ONLY_EXCLUDED_TOOLS } : {}),
+        requestPermission: Boolean(options.readOnly)
+      });
+    } else {
+      emit(options.onProgress, "Creating Copilot session.", "starting", { copilotSessionId: sessionId });
+      await client.request("session.create", {
+        sessionId,
+        workingDirectory: cwd,
+        model: options.model,
+        ...(options.effort ? { reasoningEffort: options.effort } : {}),
+        ...(options.readOnly ? { excludedTools: READ_ONLY_EXCLUDED_TOOLS } : {}),
+        ...(options.agent ? { agent: options.agent } : {}),
+        enableFileChangeTracking: true,
+        streaming: false,
+        requestPermission: Boolean(options.readOnly),
+        clientName: "claude-code-copilot-plugin"
+      });
+
+      if (options.sessionName) {
+        await client.request("session.name.set", { sessionId, name: options.sessionName }).catch(() => {});
+      }
+    }
+
+    const mode = options.readOnly ? "plan" : "interactive";
+    await client.request("session.mode.set", { sessionId, mode });
+    if (!options.readOnly) {
+      await client.request("session.permissions.setAllowAll", { sessionId, enabled: true }).catch(() => {});
+    }
+
+    const prompt = options.prompt?.trim() || options.defaultPrompt || "";
+    if (!prompt) {
+      throw new Error("A prompt is required for this Copilot run.");
+    }
+
+    // Sampled BEFORE the turn so the usage stored on this job is the delta
+    // this turn cost, not the resumed session's running total — see
+    // mergeUsageMetrics. On a fresh session this is zero (or null when the
+    // RPC is unsupported), so the delta equals the total, unchanged.
+    const usageBaseline = await fetchUsageMetrics(client, sessionId);
+
+    const send = await client.request("session.send", { sessionId, prompt });
+
+    capture.started = true;
+    for (const event of capture.buffered) {
+      applyEvent(capture, event);
+    }
+    capture.buffered.length = 0;
+
+    // C1 fix: `await capture.promise` alone has no bound. Before this fix,
+    // the only two things that could ever settle it were session.idle and
+    // scheduleInferredCompletion's message-gated 250ms timer — a round
+    // that produces no assistant.message (self-collect's tool-only round 1
+    // is exactly this) followed by a dropped connection or the copilot
+    // process dying left the turn suspended forever, with no timeout, no
+    // abort, and no reference from rpc-client.mjs's handleExit back to
+    // this promise at all. Racing client.exitPromise closes that hole: it
+    // resolves the moment the child process actually exits or errors (see
+    // rpc-client.mjs), independent of anything session-event-based. The
+    // absolute-ceiling timer is the final backstop for a process that
+    // stays alive but goes silent — see DEFAULT_ABSOLUTE_TURN_TIMEOUT_MS.
+    const absoluteTimeoutMs = options.absoluteTimeoutMs ?? DEFAULT_ABSOLUTE_TURN_TIMEOUT_MS;
+    let absoluteTimeoutHandle;
+    const absoluteTimeout = new Promise((resolve) => {
+      absoluteTimeoutHandle = setTimeout(() => resolve({ outcome: "timed-out" }), absoluteTimeoutMs);
+      absoluteTimeoutHandle.unref?.();
+    });
+
+    const settled = await Promise.race([
+      capture.promise.then(() => ({ outcome: "completed" })),
+      client.exitPromise.then((failure) => ({ outcome: "exited", failure })),
+      absoluteTimeout
+    ]);
+    clearTimeout(absoluteTimeoutHandle);
+
+    if (settled.outcome !== "completed" && !capture.completed) {
+      capture.completed = true;
+      clearTimeout(capture.timer);
+      if (settled.outcome === "exited") {
+        const detail = settled.failure instanceof Error ? settled.failure.message : String(settled.failure);
+        emit(options.onProgress, `Copilot connection ended before the turn completed: ${detail}`, "failed");
+        capture.error = capture.error ?? { message: `Copilot connection ended before the turn completed: ${detail}` };
+      } else if (settled.outcome === "timed-out") {
+        emit(
+          options.onProgress,
+          `Copilot turn exceeded its ${absoluteTimeoutMs}ms absolute ceiling without completing.`,
+          "failed"
+        );
+        capture.error = capture.error ?? {
+          message: `Copilot turn exceeded its ${absoluteTimeoutMs}ms absolute ceiling without completing.`
+        };
+        // The process is still alive and unresponsive — don't leave it
+        // running after we've given up waiting on it.
+        await client.forceKillProcess().catch(() => {});
+      }
+    }
+
+    // Drain any permission replies still in flight (see
+    // pendingPermissionReplies above) before touching the client again —
+    // assistant.turn_end can arrive before the reply to a permission
+    // request the same turn raised has finished its round trip.
+    await Promise.all(pendingPermissionReplies);
+
+    // Fix C (Task 16 follow-up): `assistant.usage` events and `session.shutdown`
+    // (which only fires on session.destroy, which this function never calls)
+    // both returned nothing against the real Copilot CLI — every real turn in
+    // acceptance testing came back with usage.premiumRequests: null.
+    // `session.usage.getMetrics` was probed live and does return real numbers,
+    // so query it once the turn has resolved, before the client closes. This
+    // is additive: if the query fails (e.g. the test fixture doesn't implement
+    // it, or an older CLI predates this RPC), the event-based capture.usage
+    // stays exactly as it was.
+    const metrics = await fetchUsageMetrics(client, sessionId);
+
+    return {
+      status: capture.error ? 1 : 0,
+      sessionId,
+      mode,
+      messageId: send?.messageId ?? null,
+      finalMessage: capture.finalMessage,
+      reasoningSummary: capture.reasoning,
+      touchedFiles: preferMetricsTouchedFiles([...capture.touchedFiles], metrics),
+      commandExecutions: capture.commandExecutions,
+      usage: { ...mergeUsageMetrics(capture.usage, metrics, usageBaseline), model: options.model },
+      error: capture.error,
+      stderr: client.stderr
+    };
+  });
+}
+
+export async function interruptCopilotTurn(cwd, { sessionId }, options = {}) {
+  if (!sessionId) {
+    return { attempted: false, interrupted: false, detail: "missing sessionId" };
+  }
+
+  try {
+    return await withClient(cwd, options, async (client) => {
+      try {
+        await client.request("session.interruptMainTurn", { sessionId });
+      } catch {
+        await client.request("session.abort", { sessionId });
+      }
+      return { attempted: true, interrupted: true, detail: `Interrupted ${sessionId}.` };
+    });
+  } catch (error) {
+    return {
+      attempted: true,
+      interrupted: false,
+      detail: error instanceof Error ? error.message : String(error)
+    };
+  }
+}
+
+function canonicalDirectory(directory) {
+  const resolved = path.resolve(directory);
+  try {
+    return fs.realpathSync(resolved);
+  } catch {
+    return resolved;
+  }
+}
+
+export async function findLatestTaskSession(cwd, options = {}) {
+  const canonicalCwd = canonicalDirectory(cwd);
+  return withClient(cwd, options, async (client) => {
+    const response = await client.request("sessions.list", { limit: 20 });
+    const match = (response?.sessions ?? []).find(
+      (session) =>
+        typeof session.name === "string" &&
+        session.name.startsWith(TASK_SESSION_PREFIX) &&
+        // An exact, canonicalised match is required. Treating a session with
+        // NO recorded cwd as a match for every repository — the previous
+        // behaviour — let `/copilot:rescue --resume` pick up the newest task
+        // session from an unrelated workspace and continue it here, applying
+        // write-capable edits informed by another repository's history. A
+        // session we cannot place is not a session we can safely resume;
+        // starting a fresh one is the cheap, correct failure.
+        typeof session.context?.cwd === "string" &&
+        canonicalDirectory(session.context.cwd) === canonicalCwd
+    );
+    return match ? { sessionId: match.sessionId } : null;
+  });
+}
+
+export function buildTaskSessionName(prompt) {
+  const excerpt = shorten(prompt, 56);
+  return excerpt ? `${TASK_SESSION_PREFIX}: ${excerpt}` : TASK_SESSION_PREFIX;
+}
+
+export function parseStructuredOutput(rawOutput, fallback = {}) {
+  const text = String(rawOutput ?? "").trim();
+  if (!text) {
+    return {
+      parsed: null,
+      parseError: fallback.failureMessage ?? "Copilot did not return a final message.",
+      rawOutput: ""
+    };
+  }
+
+  const fenced = /^```(?:json)?\s*\n([\s\S]*?)\n```$/m.exec(text);
+  const candidate = fenced ? fenced[1] : text;
+
+  try {
+    return { parsed: JSON.parse(candidate), parseError: null, rawOutput: text };
+  } catch (error) {
+    return { parsed: null, parseError: error.message, rawOutput: text };
+  }
+}
