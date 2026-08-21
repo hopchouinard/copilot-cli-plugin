@@ -523,3 +523,52 @@ test("effort is validated against the model being set, not the one being replace
   assert.equal(config.reviewModel, "claude-sonnet-4.6");
   assert.equal(config.effort, "max");
 });
+
+// ---------------------------------------------------------------------------
+// PR #2 Copilot review: the second refresh was gated on whether the first
+// SUCCEEDED, not on whether it was attempted. A stale catalog plus an
+// unreachable Copilot therefore produced two doomed client connections
+// instead of one, on the cost guard's critical path — the last checkpoint
+// before a paid background run.
+// ---------------------------------------------------------------------------
+
+const COUNTING_STUB = path.join(path.dirname(fileURLToPath(import.meta.url)), "stub-copilot-count.mjs");
+
+function withUnreachableCopilot() {
+  const log = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "copilot-spawn-")), "spawns.log");
+  fs.writeFileSync(log, "", "utf8");
+  return {
+    log,
+    options: { binary: COUNTING_STUB, env: { ...process.env, COPILOT_SPAWN_LOG: log } },
+    count: () => fs.readFileSync(log, "utf8").split("\n").filter(Boolean).length
+  };
+}
+
+test("an unreachable Copilot is contacted at most once per cost check", async () => {
+  const cwd = tempWorkspace();
+  // Stale AND unable to price the requested model: both refresh triggers fire.
+  setConfig(cwd, "modelCatalog", {
+    models: [{ id: "only-known-model", multiplier: 1, reasoningEfforts: [] }],
+    cachedAt: "2020-01-01T00:00:00.000Z"
+  });
+  const copilot = withUnreachableCopilot();
+
+  const check = await buildCostCheck(cwd, { role: "review", model: "a-model-not-in-the-catalog", ...copilot.options });
+
+  assert.equal(copilot.count(), 1, `expected one connection attempt, made ${copilot.count()}`);
+  // The fail-safe is unaffected: an unpriceable model still trips the guard.
+  assert.equal(check.catalogRefreshed, false);
+  assert.equal(check.costUnknown, true);
+  assert.equal(check.exceeds, true);
+});
+
+test("a reachable Copilot is still contacted once when only the absent-model trigger fires", async () => {
+  const cwd = tempWorkspace();
+  const check = await buildCostCheck(cwd, {
+    role: "review",
+    model: "brand-new-costly",
+    ...withScenario({ models: REFRESHED_MODELS })
+  });
+  assert.equal(check.catalogRefreshed, true, "a fresh-but-incomplete catalog must still refresh");
+  assert.equal(check.multiplier, 20);
+});

@@ -685,8 +685,17 @@ export async function buildCostCheck(cwd, options = {}) {
   // another, with `exceeds` computed for the wrong one. Staleness does not
   // depend on which model was asked for, so this check needs no resolution to
   // run first.
+  // `catalogRefreshed` reports whether a NEW catalog was obtained, which is
+  // what the caller wants to know. Gating the second refresh on it conflated
+  // that with "did we already try": a stale catalog plus an unreachable
+  // Copilot left it false, so an unpriceable model triggered a second fetch
+  // that was bound to fail exactly as the first did — two dead client
+  // connections instead of one, on the last checkpoint before a paid run.
+  // The attempt counter gates the retry; the success flag stays a report.
   let catalogRefreshed = false;
+  let catalogRefreshAttempted = false;
   const refreshCatalog = async () => {
+    catalogRefreshAttempted = true;
     try {
       catalog = await fetchModelCatalog(cwd, options);
       setConfig(workspaceRoot, "modelCatalog", catalog);
@@ -719,7 +728,7 @@ export async function buildCostCheck(cwd, options = {}) {
   // can only be discovered after resolution. Re-resolve afterwards so the
   // returned model always comes from the catalog this function priced against
   // — the invariant the row numbering depends on.
-  if (options.refreshCatalog !== false && !catalogRefreshed && !catalogHasModel(model, catalog)) {
+  if (options.refreshCatalog !== false && !catalogRefreshAttempted && !catalogHasModel(model, catalog)) {
     await refreshCatalog();
     ({ model, source } = resolveAgainstCatalog());
   }
