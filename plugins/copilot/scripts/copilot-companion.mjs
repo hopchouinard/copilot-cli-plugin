@@ -34,12 +34,15 @@ import {
   readRepoSettings,
   catalogHasModel,
   isCatalogStale,
+  orderedCatalogModels,
+  resolveModelSelection,
   cheapestModel
 } from "./lib/models.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
 import {
   renderSetupReport,
+  renderModelTable,
   renderReviewResult,
   renderTaskResult,
   renderStatusReport,
@@ -85,24 +88,21 @@ export async function buildSetupReport(cwd, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const actionsTaken = [];
 
-  for (const [flag, key] of [
-    ["model", null],
-    ["review-model", "reviewModel"],
-    ["task-model", "taskModel"]
-  ]) {
-    const value = options[flag];
-    if (!value) {
-      continue;
+  // Every requested change is validated and staged here, and NOTHING is
+  // persisted until all of them pass. Applying them as they were parsed meant
+  // a command that failed still changed settings: `/copilot:setup
+  // --enable-review-gate --model 99` reported "Invalid model number" and
+  // exited non-zero having already turned the review gate ON, so the user was
+  // told the command failed while it had quietly started spending a premium
+  // request on every stop. A rejected command must leave configuration exactly
+  // as it found it.
+  const pending = new Map();
+  const stage = (key, value, note) => {
+    pending.set(key, value);
+    if (note) {
+      actionsTaken.push(note);
     }
-    if (flag === "model") {
-      setConfig(workspaceRoot, "reviewModel", value);
-      setConfig(workspaceRoot, "taskModel", value);
-      actionsTaken.push(`Set both review and task models to ${value}.`);
-    } else {
-      setConfig(workspaceRoot, key, value);
-      actionsTaken.push(`Set ${key} to ${value}.`);
-    }
-  }
+  };
 
   if (options["cost-warn-threshold"] !== undefined) {
     // Fix: an unparseable value (e.g. "abc") used to serialize to `null`
@@ -115,16 +115,13 @@ export async function buildSetupReport(cwd, options = {}) {
         `Invalid --cost-warn-threshold "${options["cost-warn-threshold"]}": expected a number >= 0 (use 0 to disable).`
       );
     }
-    setConfig(workspaceRoot, "costWarnThreshold", threshold);
-    actionsTaken.push(`Set the cost warning threshold to ${threshold}x.`);
+    stage("costWarnThreshold", threshold, `Set the cost warning threshold to ${threshold}x.`);
   }
 
   if (options["enable-review-gate"]) {
-    setConfig(workspaceRoot, "stopReviewGate", true);
-    actionsTaken.push("Enabled the stop-time review gate.");
+    stage("stopReviewGate", true, "Enabled the stop-time review gate.");
   } else if (options["disable-review-gate"]) {
-    setConfig(workspaceRoot, "stopReviewGate", false);
-    actionsTaken.push("Disabled the stop-time review gate.");
+    stage("stopReviewGate", false, "Disabled the stop-time review gate.");
   }
 
   const node = binaryAvailable("node", ["--version"], { cwd });
@@ -137,6 +134,10 @@ export async function buildSetupReport(cwd, options = {}) {
   let config = getConfig(workspaceRoot);
   let modelCatalog = config.modelCatalog;
 
+  // The catalog is a cache with a TTL, not a user setting, and it is refreshed
+  // automatically regardless of what else this call does — so writing it
+  // before the staged settings apply is not partial application of the user's
+  // request, and it avoids throwing away a fetch that was already paid for.
   if (copilot.available && (isCatalogStale(modelCatalog) || options.refreshCatalog)) {
     modelCatalog = await fetchModelCatalog(cwd, options);
     setConfig(workspaceRoot, "modelCatalog", modelCatalog);
@@ -146,24 +147,68 @@ export async function buildSetupReport(cwd, options = {}) {
   const userSettings = readUserSettings();
   const repoSettings = readRepoSettings(workspaceRoot);
 
+  // Resolved only after modelCatalog above is final. `--model` may be a table
+  // row number, and resolving it against the pre-refresh ordering could stage
+  // a different model than the row the user read — the one guarantee the
+  // numbering exists to provide. Staleness does not depend on which model was
+  // asked for, so the refresh can safely run first.
+  for (const [flag, key] of [
+    ["model", null],
+    ["review-model", "reviewModel"],
+    ["task-model", "taskModel"]
+  ]) {
+    const value = options[flag];
+    if (!value) {
+      continue;
+    }
+    // Stage the resolved id, never the row number the user typed. A stored
+    // "7" would silently point at a different model the next time the roster
+    // changes, which is the whole failure mode the shared ordering avoids.
+    const resolved = resolveModelSelection(value, modelCatalog).model;
+    if (flag === "model") {
+      stage("reviewModel", resolved);
+      stage("taskModel", resolved, `Set both review and task models to ${resolved}.`);
+    } else {
+      stage(key, resolved, `Set ${key} to ${resolved}.`);
+    }
+  }
+
   if (options.effort !== undefined) {
     // `effort` is ONE setting shared by both roles, so validating it against
     // the task model alone let setup persist a value the review model does
     // not accept — after which every review died in validateEffort before it
     // could run, with the failure surfacing far from the setup call that
     // caused it. Both resolved models have to accept it.
+    //
+    // Validated against the PROSPECTIVE config, so a call that sets a model
+    // and an effort together checks the effort against the model being set
+    // rather than the one being replaced.
+    const prospectiveConfig = { ...config, ...Object.fromEntries(pending) };
     for (const role of ["review", "task"]) {
-      const probe = resolveModel({ role, config, env: process.env, repoSettings, userSettings });
+      const probe = resolveModel({
+        role,
+        config: prospectiveConfig,
+        env: process.env,
+        repoSettings,
+        userSettings,
+        catalog: modelCatalog
+      });
       validateEffort(probe.model, options.effort, modelCatalog);
     }
-    setConfig(workspaceRoot, "effort", options.effort);
-    actionsTaken.push(`Set the default reasoning effort to ${options.effort}.`);
+    stage("effort", options.effort, `Set the default reasoning effort to ${options.effort}.`);
+  }
+
+  // Everything validated. Only now does anything change.
+  for (const [key, value] of pending) {
+    setConfig(workspaceRoot, key, value);
+  }
+  if (pending.size > 0) {
     config = getConfig(workspaceRoot);
   }
 
   const resolved = {
-    review: resolveModel({ role: "review", config, env: process.env, repoSettings, userSettings }),
-    task: resolveModel({ role: "task", config, env: process.env, repoSettings, userSettings }),
+    review: resolveModel({ role: "review", config, env: process.env, repoSettings, userSettings, catalog: modelCatalog }),
+    task: resolveModel({ role: "task", config, env: process.env, repoSettings, userSettings, catalog: modelCatalog }),
     effort: config.effort
   };
 
@@ -193,6 +238,60 @@ export async function buildSetupReport(cwd, options = {}) {
     actionsTaken,
     nextSteps
   };
+}
+
+// Backs the numbered model picker. Kept as its own subcommand rather than a
+// flag on `setup` because every command that needs a model choice — setup, and
+// the cost guard in review/adversarial-review/rescue — shows the same table,
+// and they must all show the SAME numbering.
+export async function buildModelListing(cwd, options = {}) {
+  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  const config = getConfig(workspaceRoot);
+  let catalog = config.modelCatalog;
+
+  // A picker is exactly where a stale roster does the most damage: the user
+  // chooses from what is displayed, so displaying an out-of-date list means
+  // choosing an out-of-date price. Refresh before showing it, and fall back to
+  // the cache when Copilot is unreachable rather than showing nothing.
+  if (options.refreshCatalog !== false && isCatalogStale(catalog)) {
+    try {
+      catalog = await fetchModelCatalog(cwd, options);
+      setConfig(workspaceRoot, "modelCatalog", catalog);
+    } catch {
+      catalog = config.modelCatalog;
+    }
+  }
+
+  const repoSettings = readRepoSettings(workspaceRoot);
+  const userSettings = readUserSettings();
+  const resolved = {
+    review: resolveModel({ role: "review", config, env: process.env, repoSettings, userSettings, catalog }).model,
+    task: resolveModel({ role: "task", config, env: process.env, repoSettings, userSettings, catalog }).model
+  };
+
+  return {
+    resolved,
+    // The same array, in the same order, that the rendered table numbers. A
+    // caller reading the JSON and a user reading the table are looking at one
+    // ordering, not two that happen to agree.
+    models: orderedCatalogModels(catalog).map((model, index) => ({ number: index + 1, ...model })),
+    catalogCachedAt: catalog?.cachedAt ?? null
+  };
+}
+
+async function handleModels(argv) {
+  const { options } = parseCommandInput(argv, {
+    valueOptions: ["cwd"],
+    booleanOptions: ["json"]
+  });
+
+  const cwd = options.cwd ? path.resolve(process.cwd(), options.cwd) : process.cwd();
+  const listing = await buildModelListing(cwd, options);
+  process.stdout.write(
+    options.json
+      ? `${JSON.stringify(listing, null, 2)}\n`
+      : renderModelTable({ models: listing.models }, listing.resolved)
+  );
 }
 
 async function handleSetup(argv) {
@@ -229,7 +328,8 @@ async function executeReview(cwd, options, { reviewLabel, template }) {
     config,
     env: process.env,
     repoSettings: readRepoSettings(workspaceRoot),
-    userSettings: readUserSettings()
+    userSettings: readUserSettings(),
+    catalog
   });
   const effort = validateEffort(model, options.effort ?? config.effort, catalog);
 
@@ -290,7 +390,8 @@ export async function executeTask(cwd, options = {}) {
     config,
     env: process.env,
     repoSettings: readRepoSettings(workspaceRoot),
-    userSettings: readUserSettings()
+    userSettings: readUserSettings(),
+    catalog
   });
   const effort = validateEffort(model, options.effort ?? config.effort, catalog);
 
@@ -570,24 +671,31 @@ export async function buildCostCheck(cwd, options = {}) {
   const config = getConfig(workspaceRoot);
   let catalog = config.modelCatalog;
 
-  const { model, source } = resolveModel({
-    role: options.role === "review" ? "review" : "task",
-    flagModel: options.model,
-    config,
-    env: process.env,
-    repoSettings: readRepoSettings(workspaceRoot),
-    userSettings: readUserSettings()
-  });
-
   // This is the last checkpoint before a paid background run, and it was
   // pricing that run off whatever the cache happened to hold: a catalog past
   // its TTL, or one that predates the model the user just named. Both make
   // describeCost report "cost unknown", and an unknown multiplier used to
   // make exceedsThreshold return false — the expensive-run confirmation was
-  // skipped precisely when the plugin knew least about the cost. Refresh
-  // first when the cache cannot answer for this model.
+  // skipped precisely when the plugin knew least about the cost.
+  //
+  // A stale catalog is refreshed BEFORE anything is resolved. `--model` may be
+  // a table row number, and resolving it against the old ordering and then
+  // persisting a new one means the review that follows resolves the same
+  // number against a DIFFERENT ordering — pricing one model and running
+  // another, with `exceeds` computed for the wrong one. Staleness does not
+  // depend on which model was asked for, so this check needs no resolution to
+  // run first.
+  // `catalogRefreshed` reports whether a NEW catalog was obtained, which is
+  // what the caller wants to know. Gating the second refresh on it conflated
+  // that with "did we already try": a stale catalog plus an unreachable
+  // Copilot left it false, so an unpriceable model triggered a second fetch
+  // that was bound to fail exactly as the first did — two dead client
+  // connections instead of one, on the last checkpoint before a paid run.
+  // The attempt counter gates the retry; the success flag stays a report.
   let catalogRefreshed = false;
-  if (options.refreshCatalog !== false && (isCatalogStale(catalog) || !catalogHasModel(model, catalog))) {
+  let catalogRefreshAttempted = false;
+  const refreshCatalog = async () => {
+    catalogRefreshAttempted = true;
     try {
       catalog = await fetchModelCatalog(cwd, options);
       setConfig(workspaceRoot, "modelCatalog", catalog);
@@ -597,6 +705,32 @@ export async function buildCostCheck(cwd, options = {}) {
       // unknown-cost branch below is the fail-safe.
       catalog = config.modelCatalog;
     }
+  };
+
+  const resolveAgainstCatalog = () =>
+    resolveModel({
+      role: options.role === "review" ? "review" : "task",
+      flagModel: options.model,
+      config,
+      env: process.env,
+      repoSettings: readRepoSettings(workspaceRoot),
+      userSettings: readUserSettings(),
+      catalog
+    });
+
+  if (options.refreshCatalog !== false && isCatalogStale(catalog)) {
+    await refreshCatalog();
+  }
+
+  let { model, source } = resolveAgainstCatalog();
+
+  // A model the roster cannot price is the second reason to refresh, and it
+  // can only be discovered after resolution. Re-resolve afterwards so the
+  // returned model always comes from the catalog this function priced against
+  // — the invariant the row numbering depends on.
+  if (options.refreshCatalog !== false && !catalogRefreshAttempted && !catalogHasModel(model, catalog)) {
+    await refreshCatalog();
+    ({ model, source } = resolveAgainstCatalog());
   }
 
   const cost = describeCost(model, catalog);
@@ -764,7 +898,8 @@ export async function executeTransfer(cwd, options = {}) {
     config,
     env: process.env,
     repoSettings: readRepoSettings(workspaceRoot),
-    userSettings: readUserSettings()
+    userSettings: readUserSettings(),
+    catalog
   });
   const effort = validateEffort(model, options.effort ?? config.effort, catalog);
 
@@ -834,6 +969,9 @@ async function main() {
   const [subcommand, ...argv] = process.argv.slice(2);
 
   switch (subcommand) {
+    case "models":
+      await handleModels(argv);
+      break;
     case "setup":
       await handleSetup(argv);
       break;

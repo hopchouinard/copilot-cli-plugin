@@ -1,4 +1,5 @@
 import { DEFAULT_MAX_STATUS_JOBS } from "./job-control.mjs";
+import { orderedCatalogModels } from "./models.mjs";
 import { describeCost, formatUsage } from "./usage.mjs";
 
 function line(label, value) {
@@ -42,6 +43,73 @@ export function renderSetupReport(report) {
   }
 
   return `${lines.join("\n")}\n`;
+}
+
+// The numbered model table. Replaces a 4-option picker that could only ever
+// offer a third of the roster: an AskUserQuestion caps at four choices, so
+// eight of twelve models were unreachable except by the user knowing an id to
+// type into "Other". A table has no such cap, and the row number is what the
+// user types back.
+//
+// The ordering comes from orderedCatalogModels so the number shown here is the
+// number resolveModelSelection maps back — the two cannot drift apart.
+export function renderModelTable(catalog, options = {}) {
+  const models = orderedCatalogModels(catalog);
+  if (models.length === 0) {
+    return "No model catalog is cached. Run `/copilot:setup` while Copilot is reachable to fetch one.\n";
+  }
+
+  const inUse = new Map();
+  for (const [role, model] of [
+    ["review", options.review],
+    ["task", options.task]
+  ]) {
+    if (!model) {
+      continue;
+    }
+    inUse.set(model, [...(inUse.get(model) ?? []), role]);
+  }
+
+  const rows = models.map((model, index) => ({
+    number: String(index + 1),
+    id: String(model.id),
+    cost:
+      typeof model.multiplier === "number"
+        ? `${model.multiplier}x`
+        : typeof model.discountPercent === "number"
+          ? `${model.discountPercent}% off`
+          : "unknown",
+    efforts: (model.reasoningEfforts ?? []).join(", ") || "(none)",
+    inUse: (inUse.get(model.id) ?? []).join(", ")
+  }));
+
+  const width = (key, header) => Math.max(header.length, ...rows.map((row) => row[key].length));
+  const numberWidth = width("number", "#");
+  const idWidth = width("id", "MODEL");
+  const costWidth = width("cost", "COST");
+  const effortsWidth = width("efforts", "EFFORT LEVELS");
+
+  const formatRow = (number, id, cost, efforts, mark) =>
+    [
+      number.padStart(numberWidth),
+      id.padEnd(idWidth),
+      cost.padEnd(costWidth),
+      mark ? efforts.padEnd(effortsWidth) : efforts,
+      mark
+    ]
+      .filter((cell) => cell !== "")
+      .join("  ")
+      .trimEnd();
+
+  const anyInUse = rows.some((row) => row.inUse);
+  const tableLines = [formatRow("#", "MODEL", "COST", "EFFORT LEVELS", anyInUse ? "IN USE" : "")];
+  for (const row of rows) {
+    tableLines.push(formatRow(row.number, row.id, row.cost, row.efforts, anyInUse ? row.inUse : ""));
+  }
+
+  tableLines.push("");
+  tableLines.push(`Reply with a number (1-${rows.length}) or a model id.`);
+  return `${tableLines.join("\n")}\n`;
 }
 
 const SEVERITY_ORDER = { critical: 0, high: 1, medium: 2, low: 3 };

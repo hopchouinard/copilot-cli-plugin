@@ -58,10 +58,25 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/copilot-companion.mjs" cost-check --role rev
 (use `--role task` in `/copilot:rescue`).
 - Always state the returned `label` to the user on the launch line, for example `model  claude-sonnet-4.6 (9x premium)`.
 - If `exceeds` is false, launch without asking.
-- If `exceeds` is true, use `AskUserQuestion` exactly once with three options in this order:
+- If `exceeds` is true, use `AskUserQuestion` exactly once with four options in this order:
   - `Run in background` — describe it as "proceed at <label>"
   - `Switch to <cheapest>` — describe it as "rerun at <cheapestLabel>"
+  - `Choose another model` — describe it as "see all models and pick one"
   - `Cancel`
+- If the user picks `Choose another model`, run the model table and let them pick from the whole roster rather than just the cheapest:
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/scripts/copilot-companion.mjs" models
+```
+
+  Show that table exactly as returned — it is numbered, sorted cheapest first, and complete. Do not use a second `AskUserQuestion` for the models themselves: it caps at four options and the roster is larger than that. Stop and let the user answer with a number or a model id.
+- **Convert the answer to a model id before doing anything else with it.** A row number is an index into a catalog that can change; a model id is stable. Read the id off the row the user picked in the table you just displayed, then re-run `cost-check` with that id and launch with the `model` value it returns:
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/scripts/copilot-companion.mjs" cost-check --role review --model <id from the chosen row> --json
+```
+
+  Never forward a row number to the launch command, and if the invocation you were given already contained `--model <number>`, replace it with the `model` id the guard returned. The guard and the run are separate processes: anything that refreshes the shared model catalog between them re-numbers the rows, so the same number can price one model and run another. Passing the id the guard actually priced makes that impossible.
 - If `costUnknown` is true, `exceeds` is true because the cost could not be established, not because a
   known multiplier is high. Say so plainly ("the multiplier for <model> could not be read from
   `models.list`") rather than quoting a figure, and omit the `Switch to <cheapest>` option when

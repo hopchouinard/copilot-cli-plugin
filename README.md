@@ -135,6 +135,25 @@ model tier or naming.
 shown by `/copilot:setup`, the cost guard, and `/copilot:status` is read live from the Copilot RPC
 `models.list` call, so it moves when GitHub reprices the model.
 
+To pick a model, run `/copilot:setup --model` with no id. That prints every model in the live
+catalog as a numbered table, cheapest first, marking which ones the review and task roles use
+today:
+
+```
+ #  MODEL                    COST     EFFORT LEVELS                   IN USE
+ 1  mai-code-1.1-flash       0.25x    low, medium, high
+ 2  claude-haiku-4.5         0.33x    (none)
+ ...
+ 8  gpt-5.4                  6x       none, low, medium, high, xhigh  review, task
+ ...
+12  auto                     10% off  (none)
+```
+
+Reply with a row number or a model id. Every command that takes `--model` accepts either, so
+`--model 8` and `--model gpt-5.4` are the same request. An id always wins over a row number, and
+only resolved ids are ever written to config — a stored row number would point somewhere else the
+next time GitHub changed the roster.
+
 Two things exist specifically to keep this cost visible:
 
 - **The cost guard.** Before backgrounding a review or rescue run, the plugin checks the resolved
