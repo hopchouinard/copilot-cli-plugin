@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+State store:
+- The plugin's state store no longer depends on which other plugins are installed alongside it.
+  Its SessionStart hook used to publish its data directory into the shared session environment
+  under the harness's own `CLAUDE_PLUGIN_DATA` name, as did the plugin this one was ported from.
+  With both installed the last SessionStart to run won, and every Bash-run command in the session
+  resolved its store to the *other* plugin's directory while hooks resolved it to the correct one.
+  `/copilot:setup --enable-review-gate` therefore set the flag somewhere the Stop hook never
+  looked, and the review gate silently never armed. The directory is now published as
+  `COPILOT_PLUGIN_DATA`, which no neighbour can clobber, and the plugin no longer overwrites the
+  shared name for its neighbours either.
+- **One-time action:** configuration written before this fix lives in another plugin's data
+  directory and is not migrated. Re-run `/copilot:setup` with your model and gate settings once.
+  The model catalog refetches on its own.
+
 Fixes for every finding raised on PR #1 by the GitHub Copilot and Codex reviewers.
 
 Security:

@@ -333,6 +333,18 @@ Examples:
 /copilot:cancel task-abc123
 ```
 
+### Where the plugin keeps its state
+
+Job records, model configuration, and the cached model catalog live in this plugin's own data
+directory, published to commands as `COPILOT_PLUGIN_DATA` by the `SessionStart` hook. The name is
+namespaced deliberately: every installed plugin appends to one shared session environment file, so
+publishing under the harness's generic `CLAUDE_PLUGIN_DATA` name means whichever plugin's
+`SessionStart` runs last decides where *every* plugin's commands read and write. When that happened,
+commands and hooks resolved different stores and the stop-time review gate never armed.
+
+If neither variable is set — a plugin installed mid-session, before its `SessionStart` has run —
+the store falls back to a temporary directory and self-heals next session.
+
 ### `/copilot:setup`
 
 Checks whether Copilot is installed and authenticated, resolves and displays the model chosen for
